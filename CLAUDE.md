@@ -38,6 +38,8 @@ A run is interactive: it needs a GUI (`cv2.imshow`), stdin input, and a live str
 
 The camera feeds have low FPS, so a vehicle can go past a counting line between two detections. For that reason, a touch on the green or red line is latched in `TrackState.cross` by `update_cross_latch`, which must run before `should_count`. The confirming observation then only has to show that the vehicle hasn't moved back from the latch point; it doesn't need to still be touching the line. Detection timing uses the frame timestamp taken in `inference_worker`, not the time the GUI receives the result.
 
+The operator can left-click a vehicle to put a red X on it (`toggle_exclusion`). Excluded tracks (`TrackState.excluded`) are never counted, and every count gate checks this flag. The marks are kept in `excl_marks` inside `run()`. A mark follows the vehicle when the tracker changes its ID, either by relink or by bbox overlap; overlap matching is used only for brand-new IDs. Marks on parked vehicles are kept for `EXCLUDE_KEEP_PARKED_SEC`.
+
 `should_count` is the main gate, and `why_not` / `diag_miss` explain rejections. That explanation appears as on-screen debug labels (key `d`) and as `[DIAG]` console lines. Supporting mechanisms:
 - `find_relink` reconnects a track to its new ID when ByteTrack switches IDs.
 - `is_duplicate_count` stops the same vehicle from being counted twice.

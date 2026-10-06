@@ -71,6 +71,9 @@ Laporan HTML (tanpa menjalankan kamera):
 
 Saat counting:
   q = keluar | d = tampilkan semua deteksi (debug) | r = edit/gambar ulang ROI
+  klik kiri kendaraan = beri/hapus TANDA X MERAH (dikecualikan, tidak pernah dihitung) | c = hapus semua tanda X
+  Tanda X ikut pindah bila ID tracker berganti; kendaraan parkir bertanda X tetap dikecualikan walau sempat hilang
+  dari deteksi (EXCLUDE_KEEP_PARKED_SEC). Kendaraan yang SUDAH terhitung sebelum diberi X tidak dikurangi.
   z = +1 motor MANUAL (ground truth) | x = +1 mobil MANUAL (ground truth)
 """
 import base64
@@ -190,6 +193,11 @@ MIN_ENTRY_VECTOR_PX = 40          # jarak minimum antar pusat area untuk menentu
 COLOR_YELLOW = (0, 255, 255)
 COLOR_GREEN = (0, 255, 0)
 COLOR_RED = (0, 0, 255)
+
+# Tanda X merah: kendaraan yang diklik operator dikecualikan dari counting
+EXCLUDE_IOU = 0.45                # ID baru mewarisi tanda X bila bbox-nya menumpuk >= 45% dgn posisi tanda (ID berganti)
+EXCLUDE_KEEP_SEC = 10.0           # tanda X kendaraan BERGERAK dibuang setelah tak terlihat selama ini (detik)
+EXCLUDE_KEEP_PARKED_SEC = 1800.0  # tanda X kendaraan DIAM/PARKIR diingat selama ini walau sempat tak terdeteksi
 ROI_STEPS = [
     ("AREA INISIALISASI (KUNING)", COLOR_YELLOW),
     ("AREA COUNTING MOTOR (HIJAU)", COLOR_GREEN),
@@ -835,6 +843,8 @@ class TrackState:
         # hijau/merah. Di FPS rendah kendaraan sering sudah melewati garis pada observasi berikutnya, jadi
         # konfirmasi tidak lagi mensyaratkan bbox MASIH menyentuh garis -- cukup tidak mundur dari titik ini.
         self.cross = {"motor": None, "car": None}
+        self.excluded = False         # True = diberi TANDA X MERAH oleh operator -> tidak pernah dihitung
+        self.mark = None              # dict tanda X milik track ini (lihat find_exclusion_mark)
 
 
 def ground_contact(poly, wheels, prev_pt, pt, box=None):
@@ -978,7 +988,7 @@ def should_count(st, pt, box, prev_box, wheels, now, green_roi, red_roi, entry_d
     """Kelas kendaraan bila SAH dihitung sekarang, selain itu None. Dipakai run() dan pengujian.
     Syarat 'menyentuh garis' dibaca dari kunci lintas (update_cross_latch harus dipanggil lebih dulu)."""
     cur_group = counting_group(st)
-    if (not st.initialized or st.counted or cur_group is None or st.parked or st.was_parked
+    if (st.excluded or not st.initialized or st.counted or cur_group is None or st.parked or st.was_parked
             or st.reverse[cur_group] or not st.outside_seen[cur_group] or st.yellow_foot_pt is None):
         return None
     target_roi = green_roi if cur_group == "motor" else red_roi
@@ -1088,7 +1098,7 @@ def is_duplicate_count(st, pt, box, g, t_c, tracks, lost):
 
 def missed_crossing_group(st, tid, counted_ids):
     """Sapuan akhir: kelas bila track ini JELAS melintas (kuning -> area counting) tetapi belum terhitung."""
-    if (not MISSED_FLUSH or st.counted or tid in counted_ids or not st.initialized or st.parked):
+    if (not MISSED_FLUSH or st.excluded or st.counted or tid in counted_ids or not st.initialized or st.parked):
         return None
     g = counting_group(st) or st.last_group
     if g not in ("motor", "car"):
@@ -1107,6 +1117,8 @@ def missed_crossing_group(st, tid, counted_ids):
 
 def why_not(st, pt, box, prev_box, wheels, now, green_roi, red_roi, entry_dirs):
     """Alasan singkat (untuk label debug) kenapa kendaraan ini belum/tidak terhitung."""
+    if st.excluded:
+        return "DIKECUALIKAN(X)"
     if st.counted:
         return "TERHITUNG"
     if not st.initialized:
@@ -1139,7 +1151,7 @@ def why_not(st, pt, box, prev_box, wheels, now, green_roi, red_roi, entry_dirs):
 
 def diag_miss(tid, st):
     """Cetak alasan track yang menyentuh area counting tetapi tidak terhitung."""
-    if st.counted or not st.initialized:
+    if st.excluded or st.counted or not st.initialized:
         return
     g = st.confirmed_group or st.last_group or "motor"
     if st.target_first_t.get(g) is None:
@@ -1185,6 +1197,80 @@ def find_relink(pool, pt, group, now):
         if score < best_score:
             best_id, best_score = old_id, score
     return best_id
+
+
+def box_iou(a, b):
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = ix * iy
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / union if union > 1e-9 else 0.0
+
+
+def find_exclusion_mark(marks, tid, box, now, allow_iou):
+    """Tanda X milik deteksi ini: ID tracker yang sama, ATAU (hanya untuk ID yang benar-benar baru = ID berganti)
+    bbox menumpuk posisi tanda X yang pemiliknya tidak terlihat di frame ini. ID lama yang sudah dilacak tidak
+    pernah mengambil tanda X lewat tumpukan, supaya kendaraan lain yang lewat di depan kendaraan bertanda X tidak
+    ikut dikecualikan."""
+    for m in marks:
+        if m["tid"] == tid:
+            return m
+    if not allow_iou:
+        return None
+    best, best_iou = None, EXCLUDE_IOU
+    for m in marks:
+        if m["t"] >= now:
+            continue
+        iou = box_iou(box, m["box"])
+        if iou >= best_iou:
+            best, best_iou = m, iou
+    return best
+
+
+def drop_exclusion_mark(m, marks, tracks, lost):
+    if m in marks:
+        marks.remove(m)
+    for s in list(tracks.values()) + list(lost.values()):
+        if s.mark is m:
+            s.excluded, s.mark = False, None
+
+
+def toggle_exclusion(click, frame_dets, marks, tracks, lost, now):
+    """Klik kiri: beri/hapus tanda X pada kendaraan terkecil yang memuat titik klik."""
+    cx, cy = click
+    hits = [(tid, box) for tid, box in frame_dets if box[0] <= cx <= box[2] and box[1] <= cy <= box[3]]
+    if hits:
+        tid, box = min(hits, key=lambda h: (h[1][2] - h[1][0]) * (h[1][3] - h[1][1]))
+        st = tracks.get(tid)
+        m = next((m for m in marks if m["tid"] == tid), None)
+        if m is not None:
+            drop_exclusion_mark(m, marks, tracks, lost)
+            print(f"[INFO] Tanda X dihapus dari #{tid} -> kendaraan ini kembali boleh dihitung")
+            return
+        m = {"tid": tid, "box": box, "t": now,
+             "parked": st is None or st.parked or st.was_parked}
+        marks.append(m)
+        if st is not None:
+            st.excluded, st.mark = True, m
+            if st.counted:
+                print(f"[WARN] #{tid} diberi tanda X tetapi SUDAH terhitung sebelumnya (hitungan tidak dikurangi)")
+        print(f"[INFO] #{tid} diberi TANDA X -> dikecualikan dari counting")
+        return
+    # Tidak mengenai deteksi: hapus tanda X yang posisinya diklik (kendaraan sedang tak terdeteksi).
+    for m in list(marks):
+        b = m["box"]
+        if b[0] <= cx <= b[2] and b[1] <= cy <= b[3]:
+            drop_exclusion_mark(m, marks, tracks, lost)
+            print(f"[INFO] Tanda X (#{m['tid']}, tak terdeteksi) dihapus")
+            return
+
+
+def draw_excluded(vis, box, text):
+    x1, y1, x2, y2 = [int(v) for v in box]
+    cv2.rectangle(vis, (x1, y1), (x2, y2), COLOR_RED, 2)
+    cv2.line(vis, (x1, y1), (x2, y2), COLOR_RED, 3)
+    cv2.line(vis, (x1, y2), (x2, y1), COLOR_RED, 3)
+    cv2.putText(vis, f"{text} X DIKECUALIKAN", (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_RED, 2)
 
 
 # ==========================================
@@ -2159,8 +2245,17 @@ def run(frame_queue, counts, truth, session):
     win = "CCTV Bapenda - AI Traffic Counting v5"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win, FRAME_W, FRAME_H)
+    excl_marks = []   # tanda X merah aktif: {"tid", "box", "t", "parked"} -- TIDAK direset saat ganti hari / edit ROI
+    clicks = []
+
+    def on_mouse(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            clicks.append((x, y))   # diproses di loop utama (state track tidak disentuh dari callback)
+
+    cv2.setMouseCallback(win, on_mouse)
     print("[INFO] Menunggu model YOLO siap di proses terpisah ...")
-    print("[INFO] Berjalan. q=keluar, d=debug, r=edit ROI, z=+motor manual, x=+mobil manual")
+    print("[INFO] Berjalan. q=keluar, d=debug, r=edit ROI, z=+motor manual, x=+mobil manual, "
+          "klik kiri=tanda X (kecualikan), c=hapus semua X")
     session["counting"] = True
 
     try:
@@ -2201,6 +2296,7 @@ def run(frame_queue, counts, truth, session):
             cv2.polylines(vis, [red_roi], True, COLOR_RED, 2)
 
             seen = set()
+            frame_dets = []   # (tid, bbox) semua deteksi frame ini -> sasaran klik tanda X
             if payload is not None:
                 xyxy = payload["xyxy"]
                 ids = payload["ids"].tolist()
@@ -2208,11 +2304,26 @@ def run(frame_queue, counts, truth, session):
                 confs = payload["conf"].tolist()
                 frame_ids = set(ids)
 
+                # Segarkan dulu tanda X yang pemiliknya terlihat di frame ini, supaya tanda tsb tidak 'dicuri'
+                # deteksi lain lewat tumpukan bbox (find_exclusion_mark hanya memakai tanda yang tidak terlihat).
+                box_by_tid = {t: tuple(float(v) for v in b) for b, t in zip(xyxy, ids)}
+                for m in excl_marks:
+                    if m["tid"] in box_by_tid:
+                        m["box"], m["t"] = box_by_tid[m["tid"]], now
+
                 for box, tid, cls_id, conf in zip(xyxy, ids, clss, confs):
                     group = "motor" if cls_id == 3 else "car"
                     x1, y1, x2, y2 = box
                     pt = ((float(x1) + float(x2)) / 2.0, float(y2))  # titik kaki = bidang tanah
                     seen.add(tid)
+                    box_t = box_by_tid[tid]
+                    frame_dets.append((tid, box_t))
+
+                    # TANDA X: dicek di SETIAP frame, termasuk deteksi yang belum/tidak punya track.
+                    is_new_id = tid not in tracks and tid not in lost
+                    mark = find_exclusion_mark(excl_marks, tid, box_t, now, allow_iou=is_new_id)
+                    if mark is not None:
+                        mark["tid"], mark["box"], mark["t"] = tid, box_t, now
 
                     st = tracks.get(tid)
 
@@ -2238,6 +2349,8 @@ def run(frame_queue, counts, truth, session):
 
                         # Belum punya track lama dan belum menyentuh kuning -> jangan buat state baru.
                         if st is None and not yellow_hit_new:
+                            if mark is not None:
+                                draw_excluded(vis, box_t, f"#{tid}")
                             continue
 
                         if st is None:
@@ -2247,6 +2360,16 @@ def run(frame_queue, counts, truth, session):
                             st.counted = True          # ID yang sudah pernah terhitung tidak dihitung lagi
                         elif st.counted:
                             counted_ids.add(tid)       # state hasil relink yang sudah terhitung
+
+                    # Track bertanda X (termasuk hasil relink ke ID baru) membawa tandanya ke ID sekarang.
+                    if mark is None and st.excluded and st.mark is not None:
+                        mark = st.mark
+                        mark["tid"], mark["box"], mark["t"] = tid, box_t, now
+                        if mark not in excl_marks:
+                            excl_marks.append(mark)
+                    if mark is not None:
+                        st.excluded, st.mark = True, mark
+                        mark["parked"] = st.parked or st.was_parked
 
                     st.frames += 1
                     # Voting kelas diperkuat: observasi confidence rendah tidak ikut menentukan
@@ -2329,6 +2452,11 @@ def run(frame_queue, counts, truth, session):
                     st.last_box = tuple(float(v) for v in box)
                     st.last_seen = now
 
+                    if st.excluded:
+                        st.mark["parked"] = st.parked or st.was_parked
+                        draw_excluded(vis, box_t, f"#{tid}")
+                        continue
+
                     display_group = st.confirmed_group or group
                     wrong_way = st.reverse[display_group] and not st.counted
                     if (st.initialized and not st.parked and not wrong_way) or debug:
@@ -2381,7 +2509,14 @@ def run(frame_queue, counts, truth, session):
                         diag_miss(tid, st)
                     del lost[tid]
 
-            pending = sum(1 for t in seen if t in tracks and tracks[t].initialized
+            # Tanda X: proses klik operator, lalu buang tanda yang pemiliknya sudah lama tak terlihat.
+            while clicks:
+                toggle_exclusion(clicks.pop(0), frame_dets, excl_marks, tracks, lost, now)
+            excl_marks[:] = [m for m in excl_marks
+                             if now - m["t"] <= (EXCLUDE_KEEP_PARKED_SEC if m["parked"] else EXCLUDE_KEEP_SEC)]
+            excluded_n = sum(1 for m in excl_marks if m["t"] >= now)
+
+            pending = sum(1 for t in seen if t in tracks and tracks[t].initialized and not tracks[t].excluded
                           and not tracks[t].counted and not tracks[t].parked and not tracks[t].was_parked
                           and not tracks[t].reverse.get(tracks[t].confirmed_group, False))
             parked_n = sum(1 for t in seen if t in tracks and tracks[t].parked)
@@ -2394,6 +2529,7 @@ def run(frame_queue, counts, truth, session):
                 f"Lewat zona kuning : {total_init}",
                 f"Sedang transit    : {pending}",
                 f"Parkir (diabaikan): {parked_n}",
+                f"Tanda X (dikecual): {excluded_n}",
                 f"FPS               : {fps:.1f}",
 ]
             if truth["car"] or truth["motor"]:
@@ -2424,6 +2560,10 @@ def run(frame_queue, counts, truth, session):
                 truth["motor"] += 1
             elif ch == "x":
                 truth["car"] += 1
+            elif ch == "c":
+                for m in list(excl_marks):
+                    drop_exclusion_mark(m, excl_marks, tracks, lost)
+                print("[INFO] Semua tanda X dihapus")
             elif ch == "r":
                 new_roi = draw_rois(frame_queue, roi)
                 if new_roi is not None:
