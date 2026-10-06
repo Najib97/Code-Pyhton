@@ -14,31 +14,6 @@ Aturan:
   * Deteksi YOLO berjalan di PROSES TERPISAH dari jendela tampilan, supaya jendela tidak "Not Responding"
     walau ada banyak kendaraan sekaligus / deteksi sedang berat.
   * Setiap ID hanya dihitung SATU KALI selama program berjalan.
-  * KENDARAAN PARKIR TIDAK DIHITUNG: objek yang diam (posisi hampir tidak berubah selama PARK_WINDOW_SEC)
-    ditandai PARKIR dan diabaikan. Counting hanya untuk kendaraan yang BERGERAK dan benar-benar MELINTASI
-    area hijau (motor) / merah (mobil) setelah sebelumnya berada di luar area tersebut.
-  * Arah satu arah: hanya kuning -> hijau/merah yang dihitung. Urutan sentuh TITIK KAKI (bidang tanah)
-    harus KUNING DULU baru HIJAU/MERAH. Kendaraan yang lebih dulu menyentuh hijau/merah baru ke kuning
-    (arah balik) ditandai ARAH BALIK dan tidak pernah dihitung.
-  * Kendaraan yang sempat BERHENTI sebentar (mis. di pos/tenda kuning) lalu jalan lagi tetap bisa dihitung
-    (PARKED_CAN_RESUME_COUNT). Parkir permanen tidak pernah dihitung karena tidak pernah bergerak melintas.
-  * Bila ByteTrack mengganti ID di tengah jalan, track lama disambung ke ID baru (relink dengan prediksi gerak).
-  * INISIALISASI LEWAT GERAK (v10): kendaraan yang baru terdeteksi setelah keluar dari bayangan/halangan (mis. di
-    bawah tenda: kaki sudah di hijau, hanya BADAN yang masih menyentuh kuning) tetap sah bila badannya menyentuh
-    kuning DAN ia bergerak maju searah kuning -> hijau/merah. Arah balik tetap ditolak karena geraknya mundur.
-  * MODE FPS RENDAH: (a) titik masuk kuning diperkirakan dari LINTASAN antar-frame, bukan posisi kaki sekarang;
-    (b) sentuhan garis hijau/merah DIKUNCI (kunci lintas), jadi observasi konfirmasi berikutnya tidak harus masih
-    menyentuh garis -- cukup tidak mundur. Kunci dilepas bila kendaraan mundur (lonjakan bbox, bukan lintasan);
-    (c) waktu gerak memakai waktu frame, bukan waktu selesai inferensi; (d) foto capture = saat menyentuh garis.
-  * ANTI-DUPLIKAT: dua ID pada kendaraan yang sama / ID yang berganti setelah terhitung tidak dihitung dua kali.
-  * SAPUAN AKHIR (MISSED_FLUSH): bila sebuah track jelas melintas (kuning -> menyentuh hijau/merah, bergerak jauh,
-    mendekat) tetapi pada saat itu tidak lolos gerbang per-frame (deteksi putus-putus, ID berganti, dsb.),
-    kendaraan tetap dihitung begitu track-nya berakhir, memakai foto saat pertama menyentuh area counting.
-  * Mode debug (tombol d): setiap kendaraan diberi label ALASAN real-time kenapa belum/tidak terhitung.
-  * Debug: saat sebuah track menyentuh area counting tetapi TIDAK terhitung, konsol mencetak baris
-    [DIAG] berisi alasannya (DIAG_LOG = True).
-  * Setiap capture yang terhitung otomatis ditambahkan ke log_capture_kendaraan.xlsx (ditulis ulang
-    berkala di thread background; bila file sedang dibuka di Excel, ditunda lalu disinkronkan otomatis).
   * Arah masuk otomatis: motor = pusat kuning -> pusat hijau, mobil = pusat kuning -> pusat merah.
   * Gambar area merah agar mencakup titik tempat mobil berhenti/parkir (titik kaki = titik magenta
     di bawah bounding box) dan JANGAN menyentuh badan jalan raya.
@@ -71,9 +46,6 @@ Laporan HTML (tanpa menjalankan kamera):
 
 Saat counting:
   q = keluar | d = tampilkan semua deteksi (debug) | r = edit/gambar ulang ROI
-  klik kiri kendaraan = beri/hapus TANDA X MERAH (dikecualikan, tidak pernah dihitung) | c = hapus semua tanda X
-  Tanda X ikut pindah bila ID tracker berganti; kendaraan parkir bertanda X tetap dikecualikan walau sempat hilang
-  dari deteksi (EXCLUDE_KEEP_PARKED_SEC). Kendaraan yang SUDAH terhitung sebelum diberi X tidak dikurangi.
   z = +1 motor MANUAL (ground truth) | x = +1 mobil MANUAL (ground truth)
 """
 import base64
@@ -82,7 +54,6 @@ import html
 import multiprocessing as mp
 import os
 import re
-import subprocess
 import sys
 import threading
 import time
@@ -133,55 +104,20 @@ TIMEOUT = 30
 FRAME_W, FRAME_H = 1024, 576
 
 # Model & deteksi
-MODEL_NAME = "yolov8l.pt"      # YOLO Large: lebih kuat untuk membedakan mobil vs motor, terutama objek kecil/jauh
-IMGSZ = 960                     # resolusi inferensi lebih tinggi untuk membantu objek kecil pada CCTV
-DET_CONF = 0.05                 # kandidat low-score tetap dipertahankan untuk ByteTrack; keputusan akhir diperketat
+MODEL_NAME = "yolov8m.pt"      # model medium: kompromi akurasi/FPS yang masih realistis untuk CCTV
+IMGSZ = 896                     # naikkan ukuran inferensi agar motor kecil/jauh lebih mudah terbaca
+DET_CONF = 0.05                 # beri ByteTrack kandidat low-score; keputusan akhir tetap lewat ROI + tracking
 MAX_DET = 200                   # jangan membuang motor hanya karena jumlah objek dalam satu frame cukup banyak
 TARGET_CLASSES = [2, 3, 5, 7]  # 2 car, 3 motorcycle, 5 bus, 7 truck
 
-# Stabilitas IDENTIFIKASI KELAS (mobil / motor)
-MIN_CLASS_CONF = 0.10           # observasi dengan confidence di bawah ini tidak ikut voting kelas
-MIN_CLASS_CONFIRM_FRAMES = 2    # minimal observasi valid sebelum kelas dipakai untuk counting
-CLASS_SCORE_MARGIN = 0.15       # kelas pemenang harus unggul minimal 15% dari kelas lain jika keduanya muncul
-
 # Logika counting
-MIN_TRAVEL_PX = 20              # jarak tempuh minimum dari titik kontak kuning sampai saat dihitung (px) ...
-TRAVEL_RATIO = 0.30             # ... atau 30% lebar bbox, mana yang lebih besar
-APPROACH_MIN_PX = 0.0           # kemajuan MENDEKATI area counting sejak kontak kuning (>=0 = tidak boleh menjauh)
-FOOT_BAND_FRAC = 0.35           # 'kaki' = 35% bagian bawah bbox (lebih toleran dari 3 titik roda saja)
-COUNT_CONFIRM_FRAMES = 2         # syarat hitung harus terpenuhi di N observasi BERURUTAN (lonjakan jitter 1 frame tidak cukup)
-CROSS_RETREAT_PX = 10.0          # FPS rendah: 'kunci lintas' hijau/merah dilepas bila kendaraan MUNDUR > max(10 px, ...
-CROSS_RETREAT_RATIO = 0.15       # ... 15% lebar bbox) dari titik saat menyentuh garis (= lonjakan bbox, bukan lintasan nyata)
-PARK_RADIUS_PERCENTILE = 85      # radius parkir memakai persentil ini (tahan lonjakan jitter), bukan nilai maksimum
-INIT_FWD_PX = 45.0               # inisialisasi lewat gerak: maju minimal sekian px sejak pertama terlihat ...
-INIT_FWD_RATIO = 0.80            # ... atau 80% lebar bbox, mana yang lebih besar (di atas jitter bbox kendaraan diam)
-DUP_WINDOW_SEC = 2.5             # anti-duplikat: dua hitungan sekelas dalam jendela waktu ini diperiksa kedekatannya
-DUP_MIN_PX = 25.0                # anti-duplikat: dianggap kendaraan yang sama bila jarak <= max(25 px, ...
-DUP_RATIO = 0.70                 # ... 70% lebar bbox)
-RELINK_BASE_PX = 45.0            # relink: jarak tersambung = 45 px + kecepatan x selang waktu ...
-RELINK_SPEED_PX_S = 120.0        # ... (px/detik), dibatasi RELINK_DIST
-MISSED_FLUSH = True              # sapuan akhir: hitung track yang jelas melintas tapi lolos dari gerbang per-frame
-FLUSH_MIN_PROGRESS_PX = 5.0      # sapuan akhir: minimal kemajuan mendekati area counting (px)
-FLUSH_MIN_TRAVEL_PX = 40.0       # sapuan akhir: jarak tempuh bersih minimal dari kontak kuning (px) ...
-FLUSH_TRAVEL_RATIO = 0.60        # ... atau 60% lebar bbox, mana yang lebih besar
-DIAG_LOG = True                 # cetak alasan bila track menyentuh area counting tapi tidak terhitung
+MIN_TRAVEL_PX = 12              # hanya sebagai filter arah; indikator counting UTAMA adalah sentuhan garis ROI
 MIN_TRACK_FRAMES = 2            # motor yang singkat terlihat tetap bisa diinisialisasi
 MIN_YELLOW_HITS = 1              # satu bukti kontak badan/anchor dengan area kuning sudah cukup
+MIN_CLASS_CONFIRM_FRAMES = 2     # class minimal 2 observasi sebelum counting
 LOST_AFTER = 1.2                 # jangan terlalu cepat melepas track saat inference tidak setiap frame
 RELINK_TIME = 4.5                # pertahankan kandidat lebih lama saat ID ByteTrack berganti
 RELINK_DIST = 140                # toleransi perpindahan posisi saat ID berubah
-
-# Deteksi PARKIR (objek diam tidak boleh dihitung) & syarat GERAK searah
-PARK_WINDOW_SEC = 3.0             # objek dianggap parkir bila nyaris tidak berpindah selama durasi ini
-PARK_MIN_SAMPLES = 3              # minimal jumlah observasi di dalam jendela tersebut (3 = tetap jalan di FPS ~1)
-PARK_MIN_RADIUS_PX = 15.0         # jitter bounding box yang masih dianggap "diam" (px)
-PARK_RADIUS_RATIO = 0.25          # ... atau 25% lebar bbox, mana yang lebih besar (kendaraan dekat kamera = jitter lebih besar)
-PARK_RELEASE_PX = 45.0            # parkir dianggap mulai berjalan lagi jika bergeser lebih dari ini (px) ...
-PARK_RELEASE_RATIO = 0.60         # ... atau 60% lebar bbox
-PARKED_CAN_RESUME_COUNT = True    # True = kendaraan yang sempat berhenti lalu jalan lagi boleh dihitung; False = tidak pernah
-MOVE_WINDOW_SEC = 2.5             # jendela waktu untuk menilai kendaraan sedang bergerak
-MOVE_MIN_PX = 25.0                # perpindahan minimum di jendela tsb (px) agar dianggap bergerak ...
-MOVE_RATIO = 0.30                 # ... atau 40% lebar bbox, mana yang lebih besar
 
 # Counting berbasis GARIS, bukan area bagian dalam ROI.
 LINE_TOUCH_TOLERANCE_PX = 5.0    # toleransi tipis untuk perbedaan bounding box/pixel CCTV
@@ -189,15 +125,26 @@ LINE_CROSS_SAMPLES = 20          # sampling lintasan antar-frame agar garis tipi
 WHEEL_INSET = 0.20                # posisi roda: kiri/tengah/kanan di bawah bounding box
 MIN_ENTRY_VECTOR_PX = 40          # jarak minimum antar pusat area untuk menentukan arah masuk
 
+# Filter otomatis kendaraan DIAM/PARKIR. Tanda X pada contoh capture hanya anotasi evaluasi;
+# TIDAK ada tombol X di aplikasi. Objek parkir/stasioner tidak boleh dihitung atau memicu capture.
+PARK_WINDOW_SEC = 3.0
+PARK_MIN_SAMPLES = 4
+PARK_MIN_RADIUS_PX = 12.0
+PARK_RADIUS_RATIO = 0.18
+PARK_RELEASE_PX = 45.0
+PARK_RELEASE_RATIO = 0.60
+MOTION_CONFIRM_MIN_SAMPLES = 4
+MOTION_CONFIRM_MIN_STEP_PX = 5.0
+MOTION_CONFIRM_RATIO = 0.20
+PARK_MEMORY_SEC = 1800.0
+PARK_MEMORY_IOU_MIN = 0.30
+PARK_MEMORY_DIST_RATIO = 0.75
+PARK_MEMORY_MIN_STABLE_SEC = 1.5
+
 # ROI
 COLOR_YELLOW = (0, 255, 255)
 COLOR_GREEN = (0, 255, 0)
 COLOR_RED = (0, 0, 255)
-
-# Tanda X merah: kendaraan yang diklik operator dikecualikan dari counting
-EXCLUDE_IOU = 0.45                # ID baru mewarisi tanda X bila bbox-nya menumpuk >= 45% dgn posisi tanda (ID berganti)
-EXCLUDE_KEEP_SEC = 10.0           # tanda X kendaraan BERGERAK dibuang setelah tak terlihat selama ini (detik)
-EXCLUDE_KEEP_PARKED_SEC = 1800.0  # tanda X kendaraan DIAM/PARKIR diingat selama ini walau sempat tak terdeteksi
 ROI_STEPS = [
     ("AREA INISIALISASI (KUNING)", COLOR_YELLOW),
     ("AREA COUNTING MOTOR (HIJAU)", COLOR_GREEN),
@@ -210,9 +157,7 @@ CSV_DELIMITER = ","                                          # Excel versi Indon
 EVENT_LOG_FILE = BASE_DIR / "log_kendaraan_terhitung.csv"    # format log utama untuk Excel sesuai field Bapenda
 CAPTURE_INDEX_FILE = BASE_DIR / "_capture_index.csv"       # index internal capture -> ID log, tidak dipakai sebagai log utama
 CAPTURE_EXCEL_FILE = BASE_DIR / "log_capture_kendaraan.xlsx" # Excel capture dengan gambar tertanam
-CAPTURE_EXCEL_SHEET = "CAPTURE" 
-CAPTURE_EXCEL_FLUSH_SEC = 4.0                                # Excel ditulis ulang paling cepat tiap N detik (hemat disk)
-CAPTURE_EXCEL_RETRY_SEC = 12.0                               # jeda coba ulang bila file Excel sedang dibuka/terkunci
+CAPTURE_EXCEL_SHEET = "CAPTURE"
 CAPTURE_EXCEL_IMAGE_W = 320
 CAPTURE_EXCEL_IMAGE_H = 180
 SUMMARY_FILE = BASE_DIR / "ringkasan_hitungan.csv"           # ringkasan jumlah mobil & motor per sumber stream
@@ -233,9 +178,9 @@ REPORT_THUMB_H = 108                                         # tinggi thumbnail 
 REPORT_DIR = BASE_DIR / "laporan"                            # laporan/laporan_<id_cctv>_<tanggal>.html
 
 TRACKER_CFG = """tracker_type: bytetrack
-track_high_thresh: 0.15
+track_high_thresh: 0.20
 track_low_thresh: 0.05
-new_track_thresh: 0.15
+new_track_thresh: 0.25
 track_buffer: 90
 match_thresh: 0.85
 fuse_score: True
@@ -514,9 +459,6 @@ def inference_worker(frame_queue, result_queue, tracker_cfg_path):
             raw = frame_queue.get(timeout=5.0)
         except Empty:
             continue
-        # Cap waktu diambil SEBELUM inferensi: durasi YOLO bervariasi (banyak/sedikit objek), jadi waktu
-        # terima hasil di GUI tidak cocok utk menghitung kecepatan/gerak -- terutama di FPS rendah.
-        t_frame = time.time()
         raw = cv2.resize(raw, (FRAME_W, FRAME_H))
         results = model.track(raw, persist=True, classes=TARGET_CLASSES, tracker=tracker_cfg_path,
                               imgsz=IMGSZ, conf=DET_CONF, max_det=MAX_DET, verbose=False)
@@ -530,7 +472,7 @@ def inference_worker(frame_queue, result_queue, tracker_cfg_path):
             }
         else:
             payload = None
-        _push_latest(result_queue, (raw, payload, t_frame))
+        _push_latest(result_queue, (raw, payload, time.time()))
 
 
 UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
@@ -813,390 +755,19 @@ class TrackState:
         self.last_group = None
         self.yellow_pt = None      # titik pertama/bukti terbaik menyentuh area kuning
         self.yellow_hits = 0
-        self.initialized = False    # TIDAK PERNAH True sebelum objek menyentuh area KUNING
+        self.initialized = False
         self.counted = False
-        self.votes = Counter()       # jumlah observasi kelas, untuk diagnosis
-        self.class_scores = Counter() # voting berbobot confidence YOLO
-        self.class_obs = Counter()    # jumlah observasi yang lolos MIN_CLASS_CONF
-        self.confirmed_group = None   # kelas stabil yang dipakai untuk counting
-        self.hist = deque(maxlen=64)  # riwayat (waktu, x, y) titik kaki, untuk deteksi parkir & arah gerak
-        self.parked = False           # True = objek diam/parkir -> diabaikan
-        self.was_parked = False       # pernah ditandai parkir
+        self.votes = Counter()
+        self.hist = deque(maxlen=64)
+        self.parked = False
         self.park_anchor = None
-        self.outside_seen = {"motor": False, "car": False}  # sudah pernah terlihat DI LUAR area counting kelasnya
-        self.yellow_foot_t = None     # waktu pertama TITIK KAKI menyentuh area kuning (inisialisasi sah)
-        self.yellow_foot_pt = None    # posisi kaki saat itu (acuan jarak/arah tempuh)
-        self.target_first_t = {"motor": None, "car": None}  # waktu pertama kaki menyentuh hijau / merah
-        self.reverse = {"motor": False, "car": False}       # True = menyentuh hijau/merah SEBELUM kuning (arah balik)
-        self.max_travel = 0.0         # jarak terjauh dari titik kontak kuning (px)
-        self.max_progress = {"motor": -1e9, "car": -1e9}    # kemajuan terbaik mendekati area counting (px)
-        self.snap = {}                # kelas -> (frame, bbox, waktu) saat PERTAMA menyentuh area counting (setelah kuning)
-        self.last_bw = 1.0
-        self.origin_pt = None         # posisi kaki saat pertama terlihat
-        self.origin_t = None
-        self.max_fwd = {"motor": -1e9, "car": -1e9}   # kemajuan terjauh searah kuning -> hijau/merah sejak titik acuan (px)
-        self.init_by_motion = False   # True = diinisialisasi lewat badan di kuning + gerak maju
-        self.counted_group = None
-        self.counted_t = None
-        self.ready_frames = 0         # jumlah observasi berurutan yang memenuhi syarat hitung
-        # Kunci lintas per kelas: (titik kaki, frame, bbox) saat kendaraan PERTAMA menyentuh/menyeberangi garis
-        # hijau/merah. Di FPS rendah kendaraan sering sudah melewati garis pada observasi berikutnya, jadi
-        # konfirmasi tidak lagi mensyaratkan bbox MASIH menyentuh garis -- cukup tidak mundur dari titik ini.
-        self.cross = {"motor": None, "car": None}
-        self.excluded = False         # True = diberi TANDA X MERAH oleh operator -> tidak pernah dihitung
-        self.mark = None              # dict tanda X milik track ini (lihat find_exclusion_mark)
+        self.motion_confirmed = False
+        self.park_memory_id = None
 
 
-def ground_contact(poly, wheels, prev_pt, pt, box=None):
-    """Titik kaki saat MASUK area (perkiraan), atau None bila kaki/roda tidak menyentuh area.
-
-    Lintasan antar-frame diperiksa lebih dulu: di FPS rendah kendaraan bisa melompat jauh ke dalam/melewati area
-    dalam satu langkah, dan titik masuk pada lintasan jauh lebih akurat daripada posisi kaki sekarang (yang
-    membuat jarak tempuh sejak kuning terlihat ~0 sehingga kendaraan yang sah gagal dihitung).
-    """
-    if prev_pt is not None:
-        for t in np.linspace(0.0, 1.0, max(2, LINE_CROSS_SAMPLES)):
-            p = (prev_pt[0] + (pt[0] - prev_pt[0]) * t, prev_pt[1] + (pt[1] - prev_pt[1]) * t)
-            if inside(poly, p):
-                return p
-    if any(inside(poly, w) or point_near_poly_boundary(poly, w) for w in wheels):
-        return pt
-    if box is not None:
-        x1, y1, x2, y2 = [float(v) for v in box]
-        band = (x1, y2 - FOOT_BAND_FRAC * max(1.0, y2 - y1), x2, y2)
-        if bbox_overlaps_polygon(poly, band):
-            return pt
-    return None
-
-
-def ground_touch(poly, wheels, prev_pt, pt, box=None):
-    """Kaki/roda menyentuh area: titik roda, lintasan antar-frame, atau pita bawah bbox (FOOT_BAND_FRAC)."""
-    return ground_contact(poly, wheels, prev_pt, pt, box) is not None
-
-
-def update_zone_order(st, wheels, prev_pt, pt, now, yellow_roi, green_roi, red_roi, box=None):
-    """Catat URUTAN sentuh zona oleh kaki.
-
-    Kuning dulu lalu hijau/merah  -> arah benar (boleh dihitung).
-    Hijau/merah dulu lalu kuning  -> arah balik: st.reverse[kelas] = True (permanen, tidak dihitung).
-    Sentuh bersamaan pada frame yang sama dianggap arah benar; kemajuan arah diperiksa di approach_progress().
-    """
-    if st.yellow_foot_t is None:
-        contact = ground_contact(yellow_roi, wheels, prev_pt, pt, box)
-        if contact is not None:
-            st.yellow_foot_t = now
-            st.yellow_foot_pt = contact
-    for g_name, g_roi in (("motor", green_roi), ("car", red_roi)):
-        if st.target_first_t[g_name] is None and ground_touch(g_roi, wheels, prev_pt, pt, box):
-            st.target_first_t[g_name] = now
-            if st.yellow_foot_t is None:          # menyentuh hijau/merah sebelum pernah menyentuh kuning
-                st.reverse[g_name] = True
-
-
-def approach_progress(st, pt, target_roi):
-    """Seberapa jauh kendaraan MENDEKAT ke area counting dibanding saat pertama menyentuh kuning (px).
-    Tidak bergantung pada garis lurus pusat-ke-pusat: jalur melengkung/diagonal tetap sah.
-    Positif = mendekat, negatif = menjauh (arah balik)."""
-    if st.yellow_foot_pt is None:
-        return None
-    d0 = -cv2.pointPolygonTest(target_roi, (float(st.yellow_foot_pt[0]), float(st.yellow_foot_pt[1])), True)
-    d1 = -cv2.pointPolygonTest(target_roi, (float(pt[0]), float(pt[1])), True)
-    return d0 - d1
-
-
-def update_motion_state(st, pt, box, now):
-    """Catat posisi, lalu tandai/lepas status PARKIR."""
-    st.hist.append((now, float(pt[0]), float(pt[1])))
-    bw = max(1.0, float(box[2]) - float(box[0]))
-    if not st.parked:
-        win = [h for h in st.hist if now - h[0] <= PARK_WINDOW_SEC]
-        if len(win) >= PARK_MIN_SAMPLES and now - win[0][0] >= PARK_WINDOW_SEC * 0.8:
-            xs = np.array([h[1] for h in win])
-            ys = np.array([h[2] for h in win])
-            cx, cy = float(xs.mean()), float(ys.mean())
-            radius = float(np.percentile(np.hypot(xs - cx, ys - cy), PARK_RADIUS_PERCENTILE))
-            if radius <= max(PARK_MIN_RADIUS_PX, PARK_RADIUS_RATIO * bw):
-                st.parked = True
-                st.was_parked = True
-                st.park_anchor = (cx, cy)
-    elif st.park_anchor is not None:
-        d = float(np.hypot(pt[0] - st.park_anchor[0], pt[1] - st.park_anchor[1]))
-        if d > max(PARK_RELEASE_PX, PARK_RELEASE_RATIO * bw):
-            st.parked = False                      # mulai berjalan lagi
-            st.hist.clear()
-            st.hist.append((now, float(pt[0]), float(pt[1])))
-            if PARKED_CAN_RESUME_COUNT:
-                st.was_parked = False
-
-
-def moving_enough(st, now, box):
-    """True jika kendaraan BERGERAK nyata (bukan jitter bbox kendaraan diam)."""
-    bw = max(1.0, float(box[2]) - float(box[0]))
-    recent = [h for h in st.hist if now - h[0] <= MOVE_WINDOW_SEC]
-    if len(recent) < 2:
-        recent = list(st.hist)[-2:]
-    if len(recent) < 2:
-        return False
-    dist = float(np.hypot(recent[-1][1] - recent[0][1], recent[-1][2] - recent[0][2]))
-    return dist >= max(MOVE_MIN_PX, MOVE_RATIO * bw)
-
-
-def counting_group(st):
-    """Kelas untuk counting: kelas yang sudah dikonfirmasi; bila belum (FPS rendah = sedikit observasi), pakai skor
-    berbobot confidence setelah >= MIN_TRACK_FRAMES frame, lalu suara terbanyak sebagai cadangan terakhir."""
-    if st.confirmed_group is not None:
-        return st.confirmed_group
-    if st.frames >= MIN_TRACK_FRAMES:
-        if st.class_scores:
-            return st.class_scores.most_common(1)[0][0]
-        if st.votes:
-            return st.votes.most_common(1)[0][0]
-    return None
-
-
-def vehicle_reaches_target(poly, box, prev_box, wheels, prev_wheels):
-    """Kendaraan menyentuh/menyeberangi garis area counting, atau sudah berada di dalamnya."""
-    if vehicle_touches_count_line(poly, box, prev_box=prev_box, wheels=wheels, prev_wheels=prev_wheels):
-        return True
-    return any(inside(poly, w) for w in wheels)
-
-
-def update_cross_latch(st, pt, box, prev_box, wheels, raw, green_roi, red_roi, entry_dirs):
-    """Kunci lintas garis hijau (motor) / merah (mobil), dipanggil SEBELUM should_count dan sebelum st.last_* diperbarui.
-
-    Kunci dipasang saat kendaraan menyentuh/menyeberangi garis atau sudah di dalam area. Kunci dilepas bila
-    kendaraan, tanpa menyentuh area lagi, MUNDUR (berlawanan arah kuning -> hijau/merah) melewati toleransi:
-    itu tanda bbox sempat melonjak ke garis, bukan kendaraan yang benar-benar melintas.
-    """
-    bw = max(1.0, float(box[2]) - float(box[0]))
-    tol = max(CROSS_RETREAT_PX, CROSS_RETREAT_RATIO * bw)
-    for g_name, g_roi in (("motor", green_roi), ("car", red_roi)):
-        if vehicle_reaches_target(g_roi, box, prev_box, wheels, st.last_wheels):
-            if st.cross[g_name] is None:
-                st.cross[g_name] = (pt, raw, tuple(float(v) for v in box))
-            continue
-        latch = st.cross[g_name]
-        if latch is None:
-            continue
-        d = entry_dirs[g_name]
-        lp = latch[0]
-        if (pt[0] - lp[0]) * float(d[0]) + (pt[1] - lp[1]) * float(d[1]) < -tol:
-            st.cross[g_name] = None
-
-
-def should_count(st, pt, box, prev_box, wheels, now, green_roi, red_roi, entry_dirs):
-    """Kelas kendaraan bila SAH dihitung sekarang, selain itu None. Dipakai run() dan pengujian.
-    Syarat 'menyentuh garis' dibaca dari kunci lintas (update_cross_latch harus dipanggil lebih dulu)."""
-    cur_group = counting_group(st)
-    if (st.excluded or not st.initialized or st.counted or cur_group is None or st.parked or st.was_parked
-            or st.reverse[cur_group] or not st.outside_seen[cur_group] or st.yellow_foot_pt is None):
-        return None
-    target_roi = green_roi if cur_group == "motor" else red_roi
-    if st.cross[cur_group] is None:
-        return None
-    bw = max(1.0, float(box[2]) - float(box[0]))
-    thr = max(MIN_TRAVEL_PX, TRAVEL_RATIO * bw)
-    if not forward_ok(st, pt, target_roi, entry_dirs[cur_group], thr):
-        return None                                   # tidak maju searah kuning -> hijau/merah
-    if not moving_enough(st, now, box):
-        return None
-    return cur_group
-
-
-def forward_ok(st, pt, target_roi, direction, thr):
-    """Maju searah kuning -> counting: proyeksi perpindahan (sejak kontak kuning) pada vektor masuk >= thr,
-    ATAU sudah mendekat ke area counting sejauh >= thr (jalur diagonal/melengkung). Mundur/menjauh = False."""
-    dx, dy = pt[0] - st.yellow_foot_pt[0], pt[1] - st.yellow_foot_pt[1]
-    if dx * float(direction[0]) + dy * float(direction[1]) >= thr:
-        return True
-    prog = approach_progress(st, pt, target_roi)
-    return prog is not None and prog >= thr
-
-
-def note_target_touch(st, prev_first, raw, box, now):
-    """Simpan foto+bbox saat kaki PERTAMA menyentuh hijau/merah (dipakai sapuan akhir & log)."""
-    for g_name in ("motor", "car"):
-        if prev_first[g_name] is None and st.target_first_t[g_name] is not None:
-            st.snap[g_name] = (raw, tuple(float(v) for v in box), now)
-
-
-def update_trajectory_stats(st, pt, box, green_roi, red_roi, entry_dirs, now=None):
-    """Catat bukti perjalanan: titik awal, jarak terjauh, kemajuan searah kuning -> counting, dan mendekati area."""
-    st.last_bw = max(1.0, float(box[2]) - float(box[0]))
-    if st.origin_pt is None:
-        st.origin_pt = (float(pt[0]), float(pt[1]))
-        st.origin_t = now
-    base = st.yellow_foot_pt if st.yellow_foot_pt is not None else st.origin_pt
-    dx, dy = pt[0] - base[0], pt[1] - base[1]
-    for g_name in ("motor", "car"):
-        proj = dx * float(entry_dirs[g_name][0]) + dy * float(entry_dirs[g_name][1])
-        if proj > st.max_fwd[g_name]:
-            st.max_fwd[g_name] = proj
-    if st.yellow_foot_pt is None:
-        return
-    st.max_travel = max(st.max_travel, float(np.hypot(pt[0] - st.yellow_foot_pt[0], pt[1] - st.yellow_foot_pt[1])))
-    for g_name, g_roi in (("motor", green_roi), ("car", red_roi)):
-        p = approach_progress(st, pt, g_roi)
-        if p is not None and p > st.max_progress[g_name]:
-            st.max_progress[g_name] = p
-
-
-def maybe_init_by_motion(st, g_hint, box):
-    """Inisialisasi lewat BADAN di kuning + gerak maju (untuk kendaraan yang baru terlihat setelah keluar dari
-    bayangan/halangan, sehingga kakinya tidak pernah tercatat di dalam kuning).
-
-    Syarat: badan (bbox) pernah menyentuh kuning, tidak parkir, dan sudah maju searah kuning -> counting minimal
-    max(INIT_FWD_PX, INIT_FWD_RATIO x lebar). Kendaraan yang bergerak MUNDUR (arah balik) atau hanya jitter tidak lolos.
-    Bila lolos, tanda 'arah balik' akibat urutan sentuh kaki dicabut karena gerak nyata membuktikan arahnya.
-    """
-    if (st.initialized or st.yellow_foot_t is not None or st.yellow_pt is None
-            or st.origin_pt is None or st.parked):
-        return False
-    g = g_hint if g_hint in ("motor", "car") else "motor"
-    bw = max(1.0, float(box[2]) - float(box[0]))
-    if st.max_fwd[g] < max(INIT_FWD_PX, INIT_FWD_RATIO * bw):
-        return False
-    st.yellow_foot_t = st.origin_t if st.origin_t is not None else time.time()
-    st.yellow_foot_pt = st.origin_pt
-    st.init_by_motion = True
-    st.outside_seen[g] = True
-    st.reverse[g] = False
-    return True
-
-
-def _pos_at(st, t):
-    """Perkiraan posisi kaki track pada waktu t (sampel terdekat, atau ekstrapolasi singkat dari kecepatan)."""
-    h = st.hist
-    if not h:
-        return None
-    best = min(h, key=lambda smp: abs(smp[0] - t))
-    if abs(best[0] - t) <= 0.35:
-        return (best[1], best[2])
-    last = h[-1]
-    if t > last[0] and len(h) >= 2 and (t - last[0]) <= 1.5:
-        prev = h[-2]
-        dt = last[0] - prev[0]
-        if dt > 1e-3:
-            vx, vy = (last[1] - prev[1]) / dt, (last[2] - prev[2]) / dt
-            return (last[1] + vx * (t - last[0]), last[2] + vy * (t - last[0]))
-    return None
-
-
-def is_duplicate_count(st, pt, box, g, t_c, tracks, lost):
-    """True bila hitungan ini kemungkinan kendaraan yang SAMA dengan yang baru terhitung (ID ganda / ID berganti)."""
-    bw = max(1.0, float(box[2]) - float(box[0]))
-    limit = max(DUP_MIN_PX, DUP_RATIO * bw)
-    for other in list(tracks.values()) + list(lost.values()):
-        if (other is st or not other.counted or other.counted_group != g or other.counted_t is None
-                or abs(t_c - other.counted_t) > DUP_WINDOW_SEC):
-            continue
-        pos = _pos_at(other, t_c)
-        if pos is not None and float(np.hypot(pt[0] - pos[0], pt[1] - pos[1])) <= limit:
-            return True
-    return False
-
-
-def missed_crossing_group(st, tid, counted_ids):
-    """Sapuan akhir: kelas bila track ini JELAS melintas (kuning -> area counting) tetapi belum terhitung."""
-    if (not MISSED_FLUSH or st.excluded or st.counted or tid in counted_ids or not st.initialized or st.parked):
-        return None
-    g = counting_group(st) or st.last_group
-    if g not in ("motor", "car"):
-        return None
-    if st.reverse[g] or st.target_first_t[g] is None or g not in st.snap or not st.outside_seen[g]:
-        return None
-    if st.was_parked and not PARKED_CAN_RESUME_COUNT:
-        return None
-    thr = max(FLUSH_MIN_TRAVEL_PX, FLUSH_TRAVEL_RATIO * st.last_bw)
-    approached = st.max_progress[g] >= FLUSH_MIN_PROGRESS_PX and st.max_travel >= thr
-    advanced = st.max_fwd[g] >= thr
-    if not (approached or advanced):
-        return None
-    return g
-
-
-def why_not(st, pt, box, prev_box, wheels, now, green_roi, red_roi, entry_dirs):
-    """Alasan singkat (untuk label debug) kenapa kendaraan ini belum/tidak terhitung."""
-    if st.excluded:
-        return "DIKECUALIKAN(X)"
-    if st.counted:
-        return "TERHITUNG"
-    if not st.initialized:
-        if st.yellow_pt is None:
-            return "belum-sentuh-kuning"
-        if st.parked:
-            return "PARKIR(belum-init)"
-        return "badan-di-kuning,tunggu-gerak-maju"
-    g = counting_group(st)
-    if g is None:
-        return "kelas-belum-pasti"
-    if st.parked:
-        return "PARKIR"
-    if st.was_parked:
-        return "pernah-parkir"
-    if st.reverse[g]:
-        return "ARAH-BALIK"
-    if not st.outside_seen[g]:
-        return "belum-di-luar-area"
-    target_roi = green_roi if g == "motor" else red_roi
-    if st.cross[g] is None:
-        return "menuju-area"
-    bw = max(1.0, float(box[2]) - float(box[0]))
-    if not forward_ok(st, pt, target_roi, entry_dirs[g], max(MIN_TRAVEL_PX, TRAVEL_RATIO * bw)):
-        return "belum-maju/menjauh"
-    if not moving_enough(st, now, box):
-        return "diam"
-    return "siap-hitung"
-
-
-def diag_miss(tid, st):
-    """Cetak alasan track yang menyentuh area counting tetapi tidak terhitung."""
-    if st.excluded or st.counted or not st.initialized:
-        return
-    g = st.confirmed_group or st.last_group or "motor"
-    if st.target_first_t.get(g) is None:
-        return
-    reasons = []
-    if st.reverse[g]:
-        reasons.append("arah-balik (menyentuh hijau/merah sebelum kuning)")
-    if st.was_parked:
-        reasons.append("sempat-diam/parkir")
-    if not st.outside_seen[g]:
-        reasons.append("tak-pernah-terlihat-di-luar-area-counting")
-    if counting_group(st) is None:
-        reasons.append("kelas-belum-pasti")
-    if not reasons:
-        reasons.append("gerak/jarak-tempuh/arah-mendekat tidak lolos")
-    print(f"[DIAG] #{tid} {g} tidak terhitung: " + ", ".join(reasons))
-
-
-def find_relink(pool, pt, group, now):
-    """Cari track lama yang paling mungkin menjadi ID baru (ByteTrack sering mengganti ID di FPS rendah).
-
-    pool = track yang hilang (lost) + track yang tidak muncul di frame ini. Jarak dihitung ke posisi terakhir
-    ATAU posisi prediksi (posisi terakhir + kecepatan). Track yang sudah terhitung / parkir tidak disambung
-    agar tidak 'menularkan' statusnya ke kendaraan lain yang kebetulan berdekatan.
-    """
-    best_id, best_score = None, float(RELINK_DIST)
-    for old_id, st in pool.items():
-        if st.last_pt is None or now - st.last_seen > RELINK_TIME or st.counted or st.parked:
-            continue
-        d = float(np.hypot(pt[0] - st.last_pt[0], pt[1] - st.last_pt[1]))
-        if len(st.hist) >= 2:
-            (t0, x0, y0), (t1, x1, y1) = st.hist[-2], st.hist[-1]
-            if t1 - t0 > 1e-3:
-                dt = min(max(0.0, now - st.last_seen), 1.5)
-                px = x1 + (x1 - x0) / (t1 - t0) * dt
-                py = y1 + (y1 - y0) / (t1 - t0) * dt
-                d = min(d, float(np.hypot(pt[0] - px, pt[1] - py)))
-        allow = min(float(RELINK_DIST), RELINK_BASE_PX + RELINK_SPEED_PX_S * max(0.0, now - st.last_seen))
-        if d > allow:
-            continue
-        class_penalty = 0.0 if st.last_group == group else min(25.0, RELINK_DIST * 0.20)
-        score = d + class_penalty
-        if score < best_score:
-            best_id, best_score = old_id, score
-    return best_id
+def _box_center(box):
+    return ((float(box[0]) + float(box[2])) / 2.0,
+            (float(box[1]) + float(box[3])) / 2.0)
 
 
 def box_iou(a, b):
@@ -1207,70 +778,131 @@ def box_iou(a, b):
     return inter / union if union > 1e-9 else 0.0
 
 
-def find_exclusion_mark(marks, tid, box, now, allow_iou):
-    """Tanda X milik deteksi ini: ID tracker yang sama, ATAU (hanya untuk ID yang benar-benar baru = ID berganti)
-    bbox menumpuk posisi tanda X yang pemiliknya tidak terlihat di frame ini. ID lama yang sudah dilacak tidak
-    pernah mengambil tanda X lewat tumpukan, supaya kendaraan lain yang lewat di depan kendaraan bertanda X tidak
-    ikut dikecualikan."""
-    for m in marks:
-        if m["tid"] == tid:
-            return m
-    if not allow_iou:
-        return None
-    best, best_iou = None, EXCLUDE_IOU
-    for m in marks:
-        if m["t"] >= now:
+def update_motion_state(st, pt, box, now):
+    """Klasifikasi PARKIR vs GERAK menggunakan beberapa frame, bukan 1 frame/jitter bbox."""
+    st.hist.append((now, float(pt[0]), float(pt[1])))
+    bw = max(1.0, float(box[2]) - float(box[0]))
+
+    recent = [h for h in st.hist if now - h[0] <= PARK_WINDOW_SEC]
+    if (not st.parked and len(recent) >= PARK_MIN_SAMPLES
+            and now - recent[0][0] >= PARK_WINDOW_SEC * 0.80):
+        xs = np.array([h[1] for h in recent], dtype=float)
+        ys = np.array([h[2] for h in recent], dtype=float)
+        cx, cy = float(xs.mean()), float(ys.mean())
+        radius = float(np.percentile(np.hypot(xs - cx, ys - cy), 85))
+        if radius <= max(PARK_MIN_RADIUS_PX, PARK_RADIUS_RATIO * bw):
+            st.parked = True
+            st.park_anchor = (cx, cy)
+            st.motion_confirmed = False
+
+    if st.parked and st.park_anchor is not None:
+        d = float(np.hypot(pt[0] - st.park_anchor[0], pt[1] - st.park_anchor[1]))
+        if d > max(PARK_RELEASE_PX, PARK_RELEASE_RATIO * bw):
+            st.parked = False
+            st.park_anchor = None
+            st.hist.clear()
+            st.hist.append((now, float(pt[0]), float(pt[1])))
+
+    recent_move = list(st.hist)[-MOTION_CONFIRM_MIN_SAMPLES:]
+    if len(recent_move) >= MOTION_CONFIRM_MIN_SAMPLES:
+        endpoint = float(np.hypot(
+            recent_move[-1][1] - recent_move[0][1],
+            recent_move[-1][2] - recent_move[0][2]))
+        path = 0.0
+        moving_steps = 0
+        step_thr = max(MOTION_CONFIRM_MIN_STEP_PX, 0.08 * bw)
+        for a, b in zip(recent_move, recent_move[1:]):
+            step = float(np.hypot(b[1] - a[1], b[2] - a[2]))
+            path += step
+            if step >= step_thr:
+                moving_steps += 1
+        motion_thr = max(20.0, MOTION_CONFIRM_RATIO * bw)
+        if ((endpoint >= motion_thr and moving_steps >= 2)
+                or (path >= 1.20 * motion_thr and endpoint >= 0.60 * motion_thr
+                    and moving_steps >= 2)):
+            st.motion_confirmed = True
+
+
+def _park_memory_match(memory, group, box, now):
+    """Cocokkan deteksi baru dengan lokasi kendaraan yang sebelumnya sudah terbukti parkir."""
+    cx, cy = _box_center(box)
+    bw = max(1.0, float(box[2]) - float(box[0]))
+    best = None
+    best_score = 1e9
+    for m in memory:
+        if m.get("group") != group:
             continue
-        iou = box_iou(box, m["box"])
-        if iou >= best_iou:
-            best, best_iou = m, iou
+        if now - m.get("last_seen", 0.0) > PARK_MEMORY_SEC:
+            continue
+        mb = m.get("box")
+        if mb is None:
+            continue
+        iou = box_iou(box, mb)
+        mcx, mcy = m["center"]
+        dist = float(np.hypot(cx - mcx, cy - mcy))
+        limit = max(25.0, PARK_MEMORY_DIST_RATIO * bw)
+        if iou < PARK_MEMORY_IOU_MIN and dist > limit:
+            continue
+        score = (1.0 - iou) * 100.0 + dist
+        if score < best_score:
+            best = m
+            best_score = score
     return best
 
 
-def drop_exclusion_mark(m, marks, tracks, lost):
-    if m in marks:
-        marks.remove(m)
-    for s in list(tracks.values()) + list(lost.values()):
-        if s.mark is m:
-            s.excluded, s.mark = False, None
+def remember_parked(memory, group, box, now):
+    """Simpan/update lokasi kendaraan parkir agar ID tracker baru tidak menghitung ulang objek yang sama."""
+    cx, cy = _box_center(box)
+    bw = max(1.0, float(box[2]) - float(box[0]))
+    for m in memory:
+        if m.get("group") != group or now - m.get("last_seen", 0.0) > PARK_MEMORY_SEC:
+            continue
+        mb = m.get("box")
+        if mb is None:
+            continue
+        iou = box_iou(box, mb)
+        mcx, mcy = m["center"]
+        dist = float(np.hypot(cx - mcx, cy - mcy))
+        if iou >= PARK_MEMORY_IOU_MIN or dist <= max(25.0, PARK_MEMORY_DIST_RATIO * bw):
+            m["center"] = (0.8 * mcx + 0.2 * cx, 0.8 * mcy + 0.2 * cy)
+            m["box"] = tuple(float(v) for v in box)
+            m["last_seen"] = now
+            return m
+    m = {
+        "id": len(memory) + 1,
+        "group": group,
+        "center": (cx, cy),
+        "box": tuple(float(v) for v in box),
+        "first_seen": now,
+        "last_seen": now,
+    }
+    memory.append(m)
+    return m
 
 
-def toggle_exclusion(click, frame_dets, marks, tracks, lost, now):
-    """Klik kiri: beri/hapus tanda X pada kendaraan terkecil yang memuat titik klik."""
-    cx, cy = click
-    hits = [(tid, box) for tid, box in frame_dets if box[0] <= cx <= box[2] and box[1] <= cy <= box[3]]
-    if hits:
-        tid, box = min(hits, key=lambda h: (h[1][2] - h[1][0]) * (h[1][3] - h[1][1]))
-        st = tracks.get(tid)
-        m = next((m for m in marks if m["tid"] == tid), None)
-        if m is not None:
-            drop_exclusion_mark(m, marks, tracks, lost)
-            print(f"[INFO] Tanda X dihapus dari #{tid} -> kendaraan ini kembali boleh dihitung")
-            return
-        m = {"tid": tid, "box": box, "t": now,
-             "parked": st is None or st.parked or st.was_parked}
-        marks.append(m)
-        if st is not None:
-            st.excluded, st.mark = True, m
-            if st.counted:
-                print(f"[WARN] #{tid} diberi tanda X tetapi SUDAH terhitung sebelumnya (hitungan tidak dikurangi)")
-        print(f"[INFO] #{tid} diberi TANDA X -> dikecualikan dari counting")
-        return
-    # Tidak mengenai deteksi: hapus tanda X yang posisinya diklik (kendaraan sedang tak terdeteksi).
-    for m in list(marks):
-        b = m["box"]
-        if b[0] <= cx <= b[2] and b[1] <= cy <= b[3]:
-            drop_exclusion_mark(m, marks, tracks, lost)
-            print(f"[INFO] Tanda X (#{m['tid']}, tak terdeteksi) dihapus")
-            return
+def prune_park_memory(memory, now):
+    memory[:] = [m for m in memory if now - m.get("last_seen", 0.0) <= PARK_MEMORY_SEC]
 
 
-def draw_excluded(vis, box, text):
-    x1, y1, x2, y2 = [int(v) for v in box]
-    cv2.rectangle(vis, (x1, y1), (x2, y2), COLOR_RED, 2)
-    cv2.line(vis, (x1, y1), (x2, y2), COLOR_RED, 3)
-    cv2.line(vis, (x1, y2), (x2, y1), COLOR_RED, 3)
-    cv2.putText(vis, f"{text} X DIKECUALIKAN", (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_RED, 2)
+def find_relink(lost, pt, group, now):
+    """Cari track lama yang paling mungkin menjadi ID baru.
+
+    Perubahan penting: perbedaan class sementara (motor terbaca car atau sebaliknya) tidak lagi
+    langsung menggagalkan relink. Kedekatan posisi tetap menjadi syarat utama, sehingga kontinuitas
+    track motor lebih terjaga ketika ByteTrack mengganti ID.
+    """
+    best_id, best_score = None, float(RELINK_DIST)
+    for old_id, st in lost.items():
+        if now - st.last_seen > RELINK_TIME or st.last_pt is None:
+            continue
+        d = float(np.hypot(pt[0] - st.last_pt[0], pt[1] - st.last_pt[1]))
+        if d > RELINK_DIST:
+            continue
+        class_penalty = 0.0 if st.last_group == group else min(25.0, RELINK_DIST * 0.20)
+        score = d + class_penalty
+        if score < best_score:
+            best_id, best_score = old_id, score
+    return best_id
 
 
 # ==========================================
@@ -1608,144 +1240,136 @@ def _read_existing_capture_excel_rows():
     return rows
 
 
-def _excel_image_dims(row):
-    """Ukuran asli gambar (di-cache di baris agar tidak dibaca ulang tiap penulisan Excel)."""
-    dims = row.get("dims")
-    if dims is None:
-        img = cv2.imread(str(BASE_DIR / row["image_path"]))
-        dims = (img.shape[1], img.shape[0]) if img is not None else (CAPTURE_EXCEL_IMAGE_W, CAPTURE_EXCEL_IMAGE_H)
-        row["dims"] = dims
-    return dims
+def append_capture_to_excel(log_id, ctx, image_path):
+    """
+    Tambahkan hasil capture ke log_capture_kendaraan.xlsx.
 
+    Format kolom:
+      ID | NOP | CCTV_ID | IMAGE_DATA
 
-def _write_capture_workbook(rows, tmp_path):
-    """Bangun workbook (ID | NOP | CCTV_ID | IMAGE_DATA) ke file sementara memakai XlsxWriter."""
-    import xlsxwriter
-    workbook = xlsxwriter.Workbook(str(tmp_path))
+    IMAGE_DATA ditanam sebagai gambar JPG di kolom D. Implementasi memakai XlsxWriter
+    agar tidak bergantung pada artifact_tool daemon yang dapat menyebabkan file Excel
+    gagal dibuat pada komputer tempat program counting dijalankan.
+    """
+    if not image_path:
+        return
+
+    image_file = BASE_DIR / image_path
+    if not image_file.exists() or not image_file.is_file():
+        print(f"[WARN] Capture untuk Excel tidak ditemukan: {image_path}")
+        return
+
     try:
+        import xlsxwriter
+    except ImportError:
+        print(
+            "[WARN] Modul XlsxWriter belum tersedia. Install sekali dengan: "
+            "python -m pip install XlsxWriter"
+        )
+        return
+
+    # Cache hanya untuk sesi berjalan agar tidak membaca ulang seluruh CSV setiap capture.
+    cache = ctx.get("_capture_excel_rows")
+    if cache is None:
+        cache = _read_existing_capture_excel_rows()
+        ctx["_capture_excel_rows"] = cache
+
+    record = {
+        "ID": str(log_id),
+        "NOP": str(ctx.get("NOP", "")),
+        "CCTV_ID": str(ctx.get("CCTV_ID", "")),
+        "image_path": image_path,
+    }
+
+    # Jangan masukkan ID yang sama dua kali.
+    if not any(str(r.get("ID")) == str(log_id) for r in cache):
+        cache.append(record)
+
+    tmp_path = CAPTURE_EXCEL_FILE.with_name(CAPTURE_EXCEL_FILE.stem + "_tmp.xlsx")
+    try:
+        workbook = xlsxwriter.Workbook(str(tmp_path))
         worksheet = workbook.add_worksheet(CAPTURE_EXCEL_SHEET)
-        header_fmt = workbook.add_format({"bold": True, "font_color": "white", "bg_color": "#1F4E78",
-                                          "align": "center", "valign": "vcenter", "border": 1})
-        text_fmt = workbook.add_format({"align": "center", "valign": "vcenter", "border": 1})
+
+        header_fmt = workbook.add_format({
+            "bold": True,
+            "font_color": "white",
+            "bg_color": "#1F4E78",
+            "align": "center",
+            "valign": "vcenter",
+            "border": 1,
+        })
+        text_fmt = workbook.add_format({
+            "align": "center",
+            "valign": "vcenter",
+            "border": 1,
+        })
+        image_fmt = workbook.add_format({
+            "align": "center",
+            "valign": "vcenter",
+            "border": 1,
+        })
+
         worksheet.set_column("A:A", 12)
         worksheet.set_column("B:B", 24)
         worksheet.set_column("C:C", 20)
         worksheet.set_column("D:D", 46)
         worksheet.set_row(0, 24)
         worksheet.freeze_panes(1, 0)
-        worksheet.autofilter(0, 0, max(1, len(rows)), 3)
-        for col, value in enumerate(["ID", "NOP", "CCTV_ID", "IMAGE_DATA"]):
+        worksheet.autofilter(0, 0, max(1, len(cache)), 3)
+
+        headers = ["ID", "NOP", "CCTV_ID", "IMAGE_DATA"]
+        for col, value in enumerate(headers):
             worksheet.write(0, col, value, header_fmt)
 
-        for row_idx, row in enumerate(rows, start=1):
+        for row_idx, row in enumerate(cache, start=1):
             worksheet.set_row(row_idx, CAPTURE_EXCEL_IMAGE_H * 0.75)
             worksheet.write(row_idx, 0, row["ID"], text_fmt)
             worksheet.write(row_idx, 1, row["NOP"], text_fmt)
             worksheet.write(row_idx, 2, row["CCTV_ID"], text_fmt)
+            worksheet.write_blank(row_idx, 3, None, image_fmt)
+
             img_path = BASE_DIR / row["image_path"]
             if not img_path.exists() or not img_path.is_file():
-                worksheet.write(row_idx, 3, "[capture tidak ditemukan]", text_fmt)
+                worksheet.write(row_idx, 3, "[capture tidak ditemukan]", image_fmt)
                 continue
-            w, h = _excel_image_dims(row)
-            scale = max(0.05, min(1.0, CAPTURE_EXCEL_IMAGE_W / max(1, w), CAPTURE_EXCEL_IMAGE_H / max(1, h)))
-            worksheet.write_blank(row_idx, 3, None, text_fmt)
-            worksheet.insert_image(row_idx, 3, str(img_path), {
-                "x_scale": scale, "y_scale": scale, "x_offset": 3, "y_offset": 3,
-                "description": f"Capture kendaraan ID {row['ID']}",
-            })
+
+            # Tentukan ukuran asli dengan OpenCV yang memang sudah menjadi dependency aplikasi.
+            img = cv2.imread(str(img_path))
+            if img is not None:
+                h, w = img.shape[:2]
+            else:
+                w, h = CAPTURE_EXCEL_IMAGE_W, CAPTURE_EXCEL_IMAGE_H
+
+            scale = min(
+                float(CAPTURE_EXCEL_IMAGE_W) / max(1, w),
+                float(CAPTURE_EXCEL_IMAGE_H) / max(1, h),
+            )
+            scale = max(0.05, min(1.0, scale))
+            worksheet.insert_image(
+                row_idx,
+                3,
+                str(img_path),
+                {
+                    "x_scale": scale,
+                    "y_scale": scale,
+                    "x_offset": 3,
+                    "y_offset": 3,
+                    "description": f"Capture kendaraan ID {row['ID']}",
+                },
+            )
+
         worksheet.write_comment(0, 3, "Gambar capture kendaraan tertanam di sel/kolom ini.")
-    finally:
         workbook.close()
 
-
-def _excel_is_locked(path):
-    """True jika file sedang dibuka program lain (Excel menguncinya di Windows)."""
-    if not path.exists():
-        return False
-    try:
-        with open(path, "r+b"):
-            return False
-    except OSError:
-        return True
-
-
-def flush_capture_excel(ctx, force=False, final=False):
-    """Tulis log_capture_kendaraan.xlsx bila ada capture baru. Dipanggil dari thread writer.
-
-    - Ditulis paling cepat tiap CAPTURE_EXCEL_FLUSH_SEC (rebuild penuh itu berat bila dilakukan per kendaraan).
-    - File sedang dibuka di Excel -> ditunda, dicoba lagi otomatis; data tidak hilang karena disimpan di memori.
-    - Saat program berhenti (final) dan file masih terkunci -> disimpan ke file cadangan bertanda waktu.
-    """
-    rows = ctx.get("_capture_excel_rows")
-    if not rows or not ctx.get("_excel_dirty"):
-        return
-    now = time.time()
-    interval = CAPTURE_EXCEL_RETRY_SEC if ctx.get("_excel_lock_warned") else CAPTURE_EXCEL_FLUSH_SEC
-    if not force and now - ctx.get("_excel_last_try", 0.0) < interval:
-        return
-    ctx["_excel_last_try"] = now
-
-    try:
-        import xlsxwriter  # noqa: F401
-    except ImportError:
-        if not ctx.get("_excel_missing_warned"):
-            print("[WARN] Modul XlsxWriter belum terpasang -> Excel capture TIDAK ditulis. "
-                  "Pasang dengan: python -m pip install XlsxWriter")
-            ctx["_excel_missing_warned"] = True
-        return
-
-    target = CAPTURE_EXCEL_FILE
-    if _excel_is_locked(target):
-        if final:
-            target = target.with_name(f"{target.stem}_{time.strftime('%Y%m%d_%H%M%S')}.xlsx")
-        else:
-            if not ctx.get("_excel_lock_warned"):
-                print(f"[WARN] {target.name} sedang dibuka (Excel). Capture baru ditahan di memori dan "
-                      f"akan otomatis ditulis begitu file ditutup.")
-                ctx["_excel_lock_warned"] = True
-            return
-
-    tmp_path = target.with_name(target.stem + "_tmp.xlsx")
-    try:
-        _write_capture_workbook(rows, tmp_path)
-        os.replace(str(tmp_path), str(target))        # atomik: Excel tidak pernah melihat file setengah jadi
+        # Ganti file secara atomik supaya Excel tidak pernah melihat file setengah jadi.
+        os.replace(str(tmp_path), str(CAPTURE_EXCEL_FILE))
     except Exception as e:
         try:
             if tmp_path.exists():
                 tmp_path.unlink()
         except OSError:
             pass
-        if not ctx.get("_excel_lock_warned"):
-            print(f"[WARN] Gagal menulis {target.name}: {e} (akan dicoba lagi)")
-            ctx["_excel_lock_warned"] = True
-        return
-    ctx["_excel_dirty"] = False
-    ctx["_excel_lock_warned"] = False
-    print(f"[INFO] {target.name} diperbarui ({len(rows)} capture)")
-
-
-def append_capture_to_excel(log_id, ctx, image_path):
-    """Daftarkan capture baru untuk log_capture_kendaraan.xlsx (format: ID | NOP | CCTV_ID | IMAGE_DATA)."""
-    if not image_path:
-        return
-    if not (BASE_DIR / image_path).is_file():
-        print(f"[WARN] Capture untuk Excel tidak ditemukan: {image_path}")
-        return
-
-    # Cache per sesi: isi awal dari CSV + index capture (riwayat), lalu ditambah capture baru.
-    cache = ctx.get("_capture_excel_rows")
-    if cache is None:
-        cache = _read_existing_capture_excel_rows()
-        ctx["_capture_excel_rows"] = cache
-    if not any(str(r.get("ID")) == str(log_id) for r in cache):
-        cache.append({
-            "ID": str(log_id),
-            "NOP": str(ctx.get("NOP", "")),
-            "CCTV_ID": str(ctx.get("CCTV_ID", "")),
-            "image_path": image_path,
-        })
-    ctx["_excel_dirty"] = True
-    flush_capture_excel(ctx)
+        print(f"[WARN] Gagal membuat {CAPTURE_EXCEL_FILE.name}: {e}")
 
 
 def log_event(raw, box, tid, group, now, ctx, counts):
@@ -2176,18 +1800,9 @@ def writer_worker(q, ctx):
     dulu dipanggil langsung di thread GUI. Sentinel None dipakai utk menghentikan thread ini dgn rapi.
     """
     while True:
-        try:
-            item = q.get(timeout=2.0)
-        except Empty:
-            # Antrean kosong: manfaatkan untuk menyinkronkan Excel yang tertunda (mis. baru ditutup dari Excel).
-            try:
-                flush_capture_excel(ctx)
-            except Exception as e:
-                print(f"[WARN] Sinkron Excel gagal: {e}")
-            continue
+        item = q.get()
         try:
             if item is None:
-                flush_capture_excel(ctx, force=True, final=True)
                 return
             kind = item[0]
             if kind == "log_event":
@@ -2235,6 +1850,7 @@ def run(frame_queue, counts, truth, session):
 
     tracks, lost = {}, {}
     counted_ids = set()   # ID yang sudah terhitung (tidak akan dihitung lagi)
+    park_memory = []      # lokasi kendaraan parkir persisten, independen dari ID ByteTrack
     total_init = 0
     fps, prev_t = 0.0, time.time()
     last_summary, last_written = time.time(), (0, 0)
@@ -2245,31 +1861,21 @@ def run(frame_queue, counts, truth, session):
     win = "CCTV Bapenda - AI Traffic Counting v5"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win, FRAME_W, FRAME_H)
-    excl_marks = []   # tanda X merah aktif: {"tid", "box", "t", "parked"} -- TIDAK direset saat ganti hari / edit ROI
-    clicks = []
-
-    def on_mouse(event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN:
-            clicks.append((x, y))   # diproses di loop utama (state track tidak disentuh dari callback)
-
-    cv2.setMouseCallback(win, on_mouse)
     print("[INFO] Menunggu model YOLO siap di proses terpisah ...")
-    print("[INFO] Berjalan. q=keluar, d=debug, r=edit ROI, z=+motor manual, x=+mobil manual, "
-          "klik kiri=tanda X (kecualikan), c=hapus semua X")
+    print("[INFO] Berjalan. q=keluar, d=debug, r=edit ROI, z=+motor manual, x=+mobil manual")
     session["counting"] = True
 
     try:
         while True:
             try:
-                raw, payload, t_frame = result_queue.get(timeout=5.0)
+                raw, payload, _ = result_queue.get(timeout=5.0)
             except Empty:
                 # Tetap proses tombol & pompa jendela walau belum ada hasil deteksi baru,
                 # supaya jendela tetap dianggap "responding" oleh Windows.
                 key_char(cv2.waitKey(30) & 0xFF)
                 continue
 
-            # Waktu frame (bukan waktu terima hasil) -> kecepatan, deteksi parkir, relink konsisten di FPS rendah.
-            now = t_frame
+            now = time.time()
             fps = 0.9 * fps + 0.1 * (1.0 / max(now - prev_t, 1e-3))
             prev_t = now
 
@@ -2286,6 +1892,7 @@ def run(frame_queue, counts, truth, session):
                 tracks.clear()
                 lost.clear()
                 counted_ids.clear()
+                park_memory.clear()
                 last_written = (0, 0)
                 current_day = today
                 print(f"[INFO] Tanggal berganti ke {today} -> semua hitungan (mobil/motor) direset ke 0.")
@@ -2296,34 +1903,17 @@ def run(frame_queue, counts, truth, session):
             cv2.polylines(vis, [red_roi], True, COLOR_RED, 2)
 
             seen = set()
-            frame_dets = []   # (tid, bbox) semua deteksi frame ini -> sasaran klik tanda X
             if payload is not None:
                 xyxy = payload["xyxy"]
                 ids = payload["ids"].tolist()
                 clss = payload["cls"].tolist()
                 confs = payload["conf"].tolist()
-                frame_ids = set(ids)
-
-                # Segarkan dulu tanda X yang pemiliknya terlihat di frame ini, supaya tanda tsb tidak 'dicuri'
-                # deteksi lain lewat tumpukan bbox (find_exclusion_mark hanya memakai tanda yang tidak terlihat).
-                box_by_tid = {t: tuple(float(v) for v in b) for b, t in zip(xyxy, ids)}
-                for m in excl_marks:
-                    if m["tid"] in box_by_tid:
-                        m["box"], m["t"] = box_by_tid[m["tid"]], now
 
                 for box, tid, cls_id, conf in zip(xyxy, ids, clss, confs):
                     group = "motor" if cls_id == 3 else "car"
                     x1, y1, x2, y2 = box
                     pt = ((float(x1) + float(x2)) / 2.0, float(y2))  # titik kaki = bidang tanah
                     seen.add(tid)
-                    box_t = box_by_tid[tid]
-                    frame_dets.append((tid, box_t))
-
-                    # TANDA X: dicek di SETIAP frame, termasuk deteksi yang belum/tidak punya track.
-                    is_new_id = tid not in tracks and tid not in lost
-                    mark = find_exclusion_mark(excl_marks, tid, box_t, now, allow_iou=is_new_id)
-                    if mark is not None:
-                        mark["tid"], mark["box"], mark["t"] = tid, box_t, now
 
                     st = tracks.get(tid)
 
@@ -2335,22 +1925,11 @@ def run(frame_queue, counts, truth, session):
                     if st is None:
                         st = lost.pop(tid, None)                       # ID lama muncul kembali
                         if st is None:
-                            # ID baru: sambung ke track lama yang sudah hilang ATAU yang tidak muncul di frame ini
-                            # (ByteTrack mengganti ID tepat saat track lama menghilang).
-                            pool = dict(lost)
-                            for k, v in tracks.items():
-                                if k not in frame_ids and v.last_seen < now:
-                                    pool[k] = v
-                            old = find_relink(pool, pt, group, now)
-                            if old is not None:
-                                st = lost.pop(old, None)
-                                if st is None:
-                                    st = tracks.pop(old, None)
+                            old = find_relink(lost, pt, group, now)    # ID baru dari track lama
+                            st = lost.pop(old) if old is not None else None
 
                         # Belum punya track lama dan belum menyentuh kuning -> jangan buat state baru.
                         if st is None and not yellow_hit_new:
-                            if mark is not None:
-                                draw_excluded(vis, box_t, f"#{tid}")
                             continue
 
                         if st is None:
@@ -2361,122 +1940,82 @@ def run(frame_queue, counts, truth, session):
                         elif st.counted:
                             counted_ids.add(tid)       # state hasil relink yang sudah terhitung
 
-                    # Track bertanda X (termasuk hasil relink ke ID baru) membawa tandanya ke ID sekarang.
-                    if mark is None and st.excluded and st.mark is not None:
-                        mark = st.mark
-                        mark["tid"], mark["box"], mark["t"] = tid, box_t, now
-                        if mark not in excl_marks:
-                            excl_marks.append(mark)
-                    if mark is not None:
-                        st.excluded, st.mark = True, mark
-                        mark["parked"] = st.parked or st.was_parked
-
                     st.frames += 1
-                    # Voting kelas diperkuat: observasi confidence rendah tidak ikut menentukan
-                    # identitas, sedangkan observasi yang lolos diberi bobot sesuai confidence YOLO.
+                    # X pada gambar referensi hanya anotasi evaluasi: kendaraan parkir/diam dideteksi otomatis.
+                    update_motion_state(st, pt, box, now)
+                    pm = _park_memory_match(park_memory, group, tuple(float(v) for v in box), now)
+                    if pm is not None and not st.motion_confirmed:
+                        st.parked = True
+                        st.park_anchor = pm["center"]
+                        st.park_memory_id = pm["id"]
+                    if st.parked:
+                        pm2 = remember_parked(park_memory, group, box, now)
+                        st.park_memory_id = pm2["id"]
+                    prune_park_memory(park_memory, now)
+                    # Voting kelas sederhana tetapi lebih stabil: jangan percaya 1 frame saja.
                     st.votes[group] += 1
-                    if float(conf) >= MIN_CLASS_CONF:
-                        st.class_obs[group] += 1
-                        st.class_scores[group] += float(conf)
                     st.last_group = group
-                    st.last_conf = float(conf)
                     prev_pt = st.last_pt
                     prev_box = st.last_box
 
-                    # --- Inisialisasi (kuning) ---
-                    # Bounding box tetap dipakai untuk MEMBUAT track, tetapi inisialisasi SAH dan urutan arah
-                    # memakai TITIK KAKI/RODA (bidang tanah). Bbox motor yang tinggi dapat menyentuh kuning
-                    # padahal kendaraannya masih di hijau -> itu penyebab arah balik ikut terhitung.
+                    # --- Inisialisasi (kuning): pakai BADAN kendaraan + segment antar-frame ---
                     yellow_hit, yellow_anchor = touches_bbox(yellow_roi, box, prev_box)
                     if yellow_hit:
                         st.yellow_hits += 1
                         if st.yellow_pt is None:
                             st.yellow_pt = yellow_anchor if yellow_anchor is not None else pt
-                    wheels = wheel_points(float(x1), float(x2), float(y2))
-                    prev_first = dict(st.target_first_t)
-                    update_zone_order(st, wheels, prev_pt, pt, now, yellow_roi, green_roi, red_roi, box)
-                    note_target_touch(st, prev_first, raw, box, now)
-                    update_trajectory_stats(st, pt, box, green_roi, red_roi, entry_dirs, now)
-                    # Kendaraan yang baru terlihat setelah keluar dari bayangan (kaki tak pernah di kuning) sah bila
-                    # badannya menyentuh kuning dan ia bergerak MAJU searah kuning -> hijau/merah.
-                    maybe_init_by_motion(st, st.confirmed_group or group, box)
-                    if (not st.initialized and st.yellow_foot_t is not None
-                            and st.frames >= MIN_TRACK_FRAMES):
+
+                    # Inisialisasi lebih cepat untuk motor, tetapi tetap harus punya minimal 2 observasi
+                    # track sehingga deteksi satu-frame yang kebetulan muncul di kuning tidak langsung sah.
+                    if (not st.initialized and st.yellow_pt is not None
+                            and st.frames >= MIN_TRACK_FRAMES
+                            and st.yellow_hits >= MIN_YELLOW_HITS):
                         st.initialized = True
                         total_init += 1
 
                     # --- Counting: INDIKATOR HANYA GARIS ROI ---
                     # Motor: badan kendaraan menyentuh/menyeberangi GARIS HIJAU.
                     # Mobil/bus/truk: roda ATAU badan kendaraan menyentuh/menyeberangi GARIS MERAH.
-                    # Tentukan kelas kendaraan secara temporal + confidence-weighted.
-                    # Ini mengurangi kasus 1-2 frame motor terbaca sebagai mobil (atau sebaliknya).
-                    valid_class_obs = sum(st.class_obs.values())
-                    ranked_classes = st.class_scores.most_common()
-                    if valid_class_obs >= MIN_CLASS_CONFIRM_FRAMES and ranked_classes:
-                        best_group, best_score = ranked_classes[0]
-                        second_score = ranked_classes[1][1] if len(ranked_classes) > 1 else 0.0
-                        margin_ok = (second_score <= 0.0 or
-                                     best_score >= second_score * (1.0 + CLASS_SCORE_MARGIN))
-                        if margin_ok:
-                            st.confirmed_group = best_group
-
-                    # Posisi/gerak: tandai PARKIR bila diam, catat apakah sudah pernah di LUAR area counting.
-                    update_motion_state(st, pt, box, now)
-                    for g_name, g_roi in (("motor", green_roi), ("car", red_roi)):
-                        if not inside(g_roi, pt) and not point_near_poly_boundary(g_roi, pt):
-                            st.outside_seen[g_name] = True
-
-                    # Syarat hitung (lihat should_count): sudah inisialisasi di kuning, kaki lebih dulu kuning baru
-                    # hijau/merah, pernah di luar area counting, tidak parkir, bergerak nyata, dan MENDEKAT.
-                    update_cross_latch(st, pt, box, prev_box, wheels, raw, green_roi, red_roi, entry_dirs)
-                    if tid not in counted_ids:
-                        cur_group = should_count(st, pt, box, prev_box, wheels, now, green_roi, red_roi, entry_dirs)
-                        st.ready_frames = st.ready_frames + 1 if cur_group is not None else 0
-                        if cur_group is not None and st.ready_frames < COUNT_CONFIRM_FRAMES:
-                            cur_group = None                 # tunggu konfirmasi di observasi berikutnya
-                        if cur_group is not None:
-                            st.counted = True
-                            st.counted_group, st.counted_t = cur_group, now
-                            counted_ids.add(tid)
-                            if is_duplicate_count(st, pt, box, cur_group, now, tracks, lost):
-                                print(f"[INFO] #{tid} {cur_group} dilewati: duplikat kendaraan yang baru terhitung")
-                            else:
+                    wheels = wheel_points(float(x1), float(x2), float(y2))
+                    vote_frames = sum(st.votes.values())
+                    if (st.initialized and not st.counted and tid not in counted_ids
+                            and not st.parked and st.motion_confirmed
+                            and vote_frames >= MIN_CLASS_CONFIRM_FRAMES):
+                        cur_group = st.votes.most_common(1)[0][0]
+                        target_roi = green_roi if cur_group == "motor" else red_roi
+                        hit = vehicle_touches_count_line(
+                            target_roi, box, prev_box=prev_box,
+                            wheels=wheels, prev_wheels=st.last_wheels
+                        )
+                        if hit:
+                            # Travel hanya menjadi filter arah minimum. Kendaraan TIDAK harus masuk
+                            # ke dalam area polygon; menyentuh garis sudah cukup sebagai trigger.
+                            travel = float(np.dot((pt[0] - st.yellow_pt[0], pt[1] - st.yellow_pt[1]),
+                                                  entry_dirs[cur_group]))
+                            if travel >= MIN_TRAVEL_PX:
+                                st.counted = True
+                                counted_ids.add(tid)
                                 counts[cur_group] += 1
-                                # Foto diambil dari saat kendaraan menyentuh garis (kunci lintas), bukan dari
-                                # observasi konfirmasi yang di FPS rendah bisa sudah jauh melewati area.
-                                _, raw_c, box_c = st.cross[cur_group]
-                                write_queue.put(("log_event", raw_c, box_c, tid, cur_group, now, dict(counts)))
+                                write_queue.put(("log_event", raw, tuple(float(v) for v in box),
+                                                  tid, cur_group, now, dict(counts)))
 
                     st.last_pt = pt
                     st.last_wheels = wheels
                     st.last_box = tuple(float(v) for v in box)
                     st.last_seen = now
 
-                    if st.excluded:
-                        st.mark["parked"] = st.parked or st.was_parked
-                        draw_excluded(vis, box_t, f"#{tid}")
-                        continue
-
-                    display_group = st.confirmed_group or group
-                    wrong_way = st.reverse[display_group] and not st.counted
-                    if (st.initialized and not st.parked and not wrong_way) or debug:
-                        color = (COLOR_GREEN if st.counted else (COLOR_YELLOW if st.initialized else (160, 160, 160)))
-                        label_extra = ""
-                        if st.parked:
-                            color, label_extra = (255, 128, 0), " PARKIR"       # hanya tampil saat debug 'd'
-                        elif wrong_way:
-                            color, label_extra = (128, 0, 255), " ARAH BALIK"   # hanya tampil saat debug 'd'
+                    if (st.initialized and not st.parked) or debug:
+                        color = COLOR_GREEN if st.counted else (COLOR_YELLOW if st.initialized else (160, 160, 160))
+                        if debug and st.parked:
+                            color = (255, 128, 0)
+                        label_extra = " PARKIR" if (debug and st.parked) else (" GERAK" if debug and st.motion_confirmed else "")
                         cv2.rectangle(vis, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-                        cv2.putText(vis, f"#{tid} {LABEL[display_group]} {conf:.2f}{label_extra}", (int(x1), int(y1) - 5),
+                        cv2.putText(vis, f"#{tid} {LABEL[group]} {conf:.2f}{label_extra}", (int(x1), int(y1) - 5),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-                        if debug:
-                            reason = why_not(st, pt, box, prev_box, wheels, now, green_roi, red_roi, entry_dirs)
-                            cv2.putText(vis, reason, (int(x1), int(y2) + 14),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
                         for wp in (wheels if group == "car" else [pt]):
                             cv2.circle(vis, (int(wp[0]), int(wp[1])), 4, (255, 0, 255), -1)
                         # Marker kecil kontak garis target saat debug/track sudah diinisialisasi.
-                        target_roi = green_roi if display_group == "motor" else red_roi
+                        target_roi = green_roi if group == "motor" else red_roi
                         for bp in bbox_anchor_points(box)[:5]:
                             if point_near_poly_boundary(target_roi, bp):
                                 cv2.circle(vis, (int(bp[0]), int(bp[1])), 5, (0, 165, 255), -1)
@@ -2486,40 +2025,16 @@ def run(frame_queue, counts, truth, session):
                 st = tracks[tid]
                 if tid not in seen and now - st.last_seen > LOST_AFTER:
                     del tracks[tid]
-                    if st.yellow_pt is not None or st.initialized:
+                    if st.yellow_pt is not None:
                         lost[tid] = st
             for tid in list(lost):
                 st = lost[tid]
                 if now - st.last_seen > RELINK_TIME:
-                    # Track yang terlalu lama hilang dibuang dari daftar relink -> sapuan akhir dulu.
-                    g_flush = missed_crossing_group(st, tid, counted_ids)
-                    if g_flush is not None:
-                        raw_s, box_s, t_s = st.snap[g_flush]
-                        st.counted = True
-                        st.counted_group, st.counted_t = g_flush, t_s
-                        counted_ids.add(tid)
-                        foot_s = ((box_s[0] + box_s[2]) / 2.0, box_s[3])
-                        if is_duplicate_count(st, foot_s, box_s, g_flush, t_s, tracks, lost):
-                            print(f"[INFO] #{tid} {g_flush} sapuan akhir dilewati: duplikat kendaraan yang sudah terhitung")
-                        else:
-                            counts[g_flush] += 1
-                            write_queue.put(("log_event", raw_s, box_s, tid, g_flush, t_s, dict(counts)))
-                            print(f"[INFO] #{tid} {g_flush} terhitung lewat SAPUAN AKHIR (melintas tapi lolos gerbang per-frame)")
-                    elif DIAG_LOG:
-                        diag_miss(tid, st)
+                    # Track yang terlalu lama hilang dibuang dari daftar relink.
                     del lost[tid]
 
-            # Tanda X: proses klik operator, lalu buang tanda yang pemiliknya sudah lama tak terlihat.
-            while clicks:
-                toggle_exclusion(clicks.pop(0), frame_dets, excl_marks, tracks, lost, now)
-            excl_marks[:] = [m for m in excl_marks
-                             if now - m["t"] <= (EXCLUDE_KEEP_PARKED_SEC if m["parked"] else EXCLUDE_KEEP_SEC)]
-            excluded_n = sum(1 for m in excl_marks if m["t"] >= now)
-
-            pending = sum(1 for t in seen if t in tracks and tracks[t].initialized and not tracks[t].excluded
-                          and not tracks[t].counted and not tracks[t].parked and not tracks[t].was_parked
-                          and not tracks[t].reverse.get(tracks[t].confirmed_group, False))
-            parked_n = sum(1 for t in seen if t in tracks and tracks[t].parked)
+            pending = sum(1 for t in seen if t in tracks and tracks[t].initialized and not tracks[t].counted
+                          and not tracks[t].parked and tracks[t].motion_confirmed)
             lines = [
                 "--- TRAFFIC ANALYTICS ---",
                 f"Mobil (Car)       : {counts['car']}",
@@ -2528,8 +2043,7 @@ def run(frame_queue, counts, truth, session):
                 "-------------------------",
                 f"Lewat zona kuning : {total_init}",
                 f"Sedang transit    : {pending}",
-                f"Parkir (diabaikan): {parked_n}",
-                f"Tanda X (dikecual): {excluded_n}",
+                f"Parkir/diam       : {sum(1 for t in seen if t in tracks and tracks[t].parked)}",
                 f"FPS               : {fps:.1f}",
 ]
             if truth["car"] or truth["motor"]:
@@ -2560,10 +2074,6 @@ def run(frame_queue, counts, truth, session):
                 truth["motor"] += 1
             elif ch == "x":
                 truth["car"] += 1
-            elif ch == "c":
-                for m in list(excl_marks):
-                    drop_exclusion_mark(m, excl_marks, tracks, lost)
-                print("[INFO] Semua tanda X dihapus")
             elif ch == "r":
                 new_roi = draw_rois(frame_queue, roi)
                 if new_roi is not None:
@@ -2617,26 +2127,6 @@ def ask_log_metadata():
     return data
 
 
-def ensure_excel_dependency():
-    """XlsxWriter dibutuhkan untuk log_capture_kendaraan.xlsx. Coba pasang otomatis bila belum ada."""
-    try:
-        import xlsxwriter  # noqa: F401
-        return True
-    except ImportError:
-        pass
-    print("[INFO] XlsxWriter belum terpasang -> mencoba memasang otomatis (untuk log_capture_kendaraan.xlsx) ...")
-    try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "XlsxWriter"])
-        import importlib
-        importlib.invalidate_caches()
-        import xlsxwriter  # noqa: F401
-        print("[INFO] XlsxWriter berhasil dipasang.")
-        return True
-    except Exception as e:
-        print(f"[WARN] Gagal memasang XlsxWriter otomatis ({e}). Pasang manual: python -m pip install XlsxWriter")
-        return False
-
-
 def main():
     if "--report" in sys.argv:
         cli_report()
@@ -2648,7 +2138,6 @@ def main():
     print(f"[INFO] Sumber stream: {'Jasnita display ' if source[0] == 'jasnita' else ''}{source[1]}")
 
     ensure_event_log_schema()
-    ensure_excel_dependency()
     metadata = ask_log_metadata()
     counts = {"car": 0, "motor": 0}
     truth = {"car": 0, "motor": 0}
