@@ -293,3 +293,16 @@ waktu,sumber,kejadian,durasi_terhubung_detik,downtime_sebelumnya_detik,detail
 2026-10-06 13:33:37,a02e5078-df7c-49da-91d8-3149b5bde589,gagal_buka,,,"backend=0 tidak berhasil membuka URL; HTTP 429, content-type=text/html, final_url=https://panel.jastrak.id/api/video-stream?token=un9ih69uCdYeJ919RCmTSB0LxCjjbIuJZs2r4D92qI5Qr5Sqa0SWYXCQgfaPtIYg"
 2026-10-06 13:33:47,a02e5078-df7c-49da-91d8-3149b5bde589,gagal_buka,,,"backend=0 tidak berhasil membuka URL; HTTP 429, content-type=text/html, final_url=https://panel.jastrak.id/api/video-stream?token=3BrGtCiZW3iawd4uRH7JnvRyTIRLiZE2XfIXi6X6I7pxHUPmEDJkLcaE16H09MFt"
 2026-10-06 13:33:56,a02e5078-df7c-49da-91d8-3149b5bde589,terhubung,,126.7,
+2026-10-06 13:38:45,a02e5078-df7c-49da-91d8-3149b5bde589,terhubung,,,
+2026-10-06 13:39:11,a02e5078-df7c-49da-91d8-3149b5bde589,terputus,25.6,,Stream terputus / frame tidak terbaca
+2026-10-06 13:39:18,a02e5078-df7c-49da-91d8-3149b5bde589,gagal_buka,,,"backend=0 tidak berhasil membuka URL; HTTP 429, content-type=text/html, final_url=https://panel.jastrak.id/api/video-stream?token=7sA5ST4ozcNTo4RYhfwTHgGJbkMWQ8u5ppY1UTb0Qsk58HQKbCZuQAsG8G6uNTRZ"
+2026-10-06 13:39:29,a02e5078-df7c-49da-91d8-3149b5bde589,gagal_buka,,,"backend=0 tidak berhasil membuka URL; HTTP 429, content-type=text/html, final_url=https://panel.jastrak.id/api/video-stream?token=7sA5ST4ozcNTo4RYhfwTHgGJbkMWQ8u5ppY1UTb0Qsk58HQKbCZuQAsG8G6uNTRZ"
+2026-10-06 13:39:38,a02e5078-df7c-49da-91d8-3149b5bde589,gagal_buka,,,"backend=0 tidak berhasil membuka URL; HTTP 429, content-type=text/html, final_url=https://panel.jastrak.id/api/video-stream?token=5kZYl1Ycg5u1gp3Eo8rPGO1e6P49WGbqLnefBsBM2v3h4xzdoBkcVeQ8hOCoZSEq"
+2026-10-06 13:39:46,a02e5078-df7c-49da-91d8-3149b5bde589,gagal_buka,,,"backend=0 tidak berhasil membuka URL; HTTP 429, content-type=text/html, final_url=https://panel.jastrak.id/api/video-stream?token=5kZYl1Ycg5u1gp3Eo8rPGO1e6P49WGbqLnefBsBM2v3h4xzdoBkcVeQ8hOCoZSEq"
+2026-10-06 13:39:55,a02e5078-df7c-49da-91d8-3149b5bde589,terhubung,,44.4,
+2026-10-06 13:40:15,a02e5078-df7c-49da-91d8-3149b5bde589,terputus,19.5,,Stream terputus / frame tidak terbaca
+2026-10-06 13:40:22,a02e5078-df7c-49da-91d8-3149b5bde589,gagal_buka,,,"backend=0 tidak berhasil membuka URL; HTTP 429, content-type=text/html, final_url=https://panel.jastrak.id/api/video-stream?token=5kZYl1Ycg5u1gp3Eo8rPGO1e6P49WGbqLnefBsBM2v3h4xzdoBkcVeQ8hOCoZSEq"
+2026-10-06 13:40:33,a02e5078-df7c-49da-91d8-3149b5bde589,gagal_buka,,,"backend=0 tidak berhasil membuka URL; HTTP 429, content-type=text/html, final_url=https://panel.jastrak.id/api/video-stream?token=5kZYl1Ycg5u1gp3Eo8rPGO1e6P49WGbqLnefBsBM2v3h4xzdoBkcVeQ8hOCoZSEq"
+2026-10-06 13:40:42,a02e5078-df7c-49da-91d8-3149b5bde589,gagal_buka,,,"backend=0 tidak berhasil membuka URL; HTTP 429, content-type=text/html, final_url=https://panel.jastrak.id/api/video-stream?token=mrqdF3JDwlDu0B7jVthBx76EcLQpSH2Zbi28O1otPVazlm9XZazzqQNuNEAJopJJ"
+2026-10-06 13:40:50,a02e5078-df7c-49da-91d8-3149b5bde589,gagal_buka,,,"backend=0 tidak berhasil membuka URL; HTTP 429, content-type=text/html, final_url=https://panel.jastrak.id/api/video-stream?token=mrqdF3JDwlDu0B7jVthBx76EcLQpSH2Zbi28O1otPVazlm9XZazzqQNuNEAJopJJ"
+2026-10-06 13:41:00,a02e5078-df7c-49da-91d8-3149b5bde589,terhubung,,44.9,

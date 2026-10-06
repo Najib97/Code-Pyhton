@@ -761,6 +761,10 @@ class TrackState:
         self.last_box = None
         self.last_group = None
         self.yellow_pt = None      # titik pertama/bukti terbaik menyentuh area kuning
+        # Titik dan waktu kontak kaki kendaraan dengan area KUNING.
+        # Dipakai directional_motion_ok() untuk memastikan gerak terjadi setelah inisialisasi.
+        self.yellow_foot_pt = None
+        self.yellow_foot_t = None
         self.yellow_hits = 0
         self.initialized = False
         self.counted = False
@@ -787,9 +791,12 @@ def box_iou(a, b):
 
 def directional_motion_ok(st, direction, now, box):
     """Validasi gerak nyata menuju arah counting. Menghindari parkir/jitter bbox."""
-    if st.yellow_foot_pt is None or st.yellow_foot_t is None:
+    # Kompatibilitas terhadap TrackState lama yang belum memiliki atribut ini.
+    yellow_foot_pt = getattr(st, "yellow_foot_pt", None)
+    yellow_foot_t = getattr(st, "yellow_foot_t", None)
+    if yellow_foot_pt is None or yellow_foot_t is None:
         return False
-    if now - st.yellow_foot_t < MIN_YELLOW_TO_TARGET_SEC:
+    if now - yellow_foot_t < MIN_YELLOW_TO_TARGET_SEC:
         return False
 
     bw = max(1.0, float(box[2]) - float(box[0]))
@@ -2005,8 +2012,12 @@ def run(frame_queue, counts, truth, session):
                     yellow_hit, yellow_anchor = touches_bbox(yellow_roi, box, prev_box)
                     if yellow_hit:
                         st.yellow_hits += 1
+                        contact_pt = yellow_anchor if yellow_anchor is not None else pt
                         if st.yellow_pt is None:
-                            st.yellow_pt = yellow_anchor if yellow_anchor is not None else pt
+                            st.yellow_pt = contact_pt
+                        if getattr(st, "yellow_foot_pt", None) is None:
+                            st.yellow_foot_pt = contact_pt
+                            st.yellow_foot_t = now
 
                     # Inisialisasi lebih cepat untuk motor, tetapi tetap harus punya minimal 2 observasi
                     # track sehingga deteksi satu-frame yang kebetulan muncul di kuning tidak langsung sah.
