@@ -140,6 +140,13 @@ PARK_MEMORY_SEC = 1800.0
 PARK_MEMORY_IOU_MIN = 0.30
 PARK_MEMORY_DIST_RATIO = 0.75
 PARK_MEMORY_MIN_STABLE_SEC = 1.5
+# Gerakan harus nyata dan konsisten menuju garis counting, bukan jitter bounding-box.
+DIRECTIONAL_MOTION_WINDOW_SEC = 2.5
+DIRECTIONAL_MOTION_MIN_NET_PX = 30.0
+DIRECTIONAL_MOTION_MIN_STEP_PX = 5.0
+DIRECTIONAL_MOTION_MIN_POSITIVE_RATIO = 0.75
+DIRECTIONAL_MOTION_MIN_POSITIVE_STEPS = 3
+MIN_YELLOW_TO_TARGET_SEC = 1.0
 
 # ROI
 COLOR_YELLOW = (0, 255, 255)
@@ -778,6 +785,41 @@ def box_iou(a, b):
     return inter / union if union > 1e-9 else 0.0
 
 
+def directional_motion_ok(st, direction, now, box):
+    """Validasi gerak nyata menuju arah counting. Menghindari parkir/jitter bbox."""
+    if st.yellow_foot_pt is None or st.yellow_foot_t is None:
+        return False
+    if now - st.yellow_foot_t < MIN_YELLOW_TO_TARGET_SEC:
+        return False
+
+    bw = max(1.0, float(box[2]) - float(box[0]))
+    recent = [h for h in st.hist if now - h[0] <= DIRECTIONAL_MOTION_WINDOW_SEC]
+    if len(recent) < DIRECTIONAL_MOTION_MIN_POSITIVE_STEPS + 1:
+        return False
+
+    dx = recent[-1][1] - recent[0][1]
+    dy = recent[-1][2] - recent[0][2]
+    net_forward = dx * float(direction[0]) + dy * float(direction[1])
+    if net_forward < max(DIRECTIONAL_MOTION_MIN_NET_PX, 0.30 * bw):
+        return False
+
+    meaningful = 0
+    positive = 0
+    for a, b in zip(recent, recent[1:]):
+        sx = b[1] - a[1]
+        sy = b[2] - a[2]
+        step = float(np.hypot(sx, sy))
+        proj = sx * float(direction[0]) + sy * float(direction[1])
+        if step >= DIRECTIONAL_MOTION_MIN_STEP_PX:
+            meaningful += 1
+            if proj > 0:
+                positive += 1
+
+    if meaningful < DIRECTIONAL_MOTION_MIN_POSITIVE_STEPS:
+        return False
+    return positive / float(meaningful) >= DIRECTIONAL_MOTION_MIN_POSITIVE_RATIO
+
+
 def update_motion_state(st, pt, box, now):
     """Klasifikasi PARKIR vs GERAK menggunakan beberapa frame, bukan 1 frame/jitter bbox."""
     st.hist.append((now, float(pt[0]), float(pt[1])))
@@ -991,6 +1033,7 @@ def draw_rois(frame_queue, initial=None):
             lines = [
                 "ROI LENGKAP (kuning + hijau + merah)",
                 "ENTER: mulai | R: ulang semua | M: ulang area merah saja",
+                "Saran: KUNING di jalur masuk, HIJAU/MERAH 60-120 px setelahnya; jangan tumpang tindih",
                 "Q / Esc: batal",
             ]
         draw_overlay(vis, lines, 10, 10, 610)
@@ -1978,8 +2021,29 @@ def run(frame_queue, counts, truth, session):
                     # Mobil/bus/truk: roda ATAU badan kendaraan menyentuh/menyeberangi GARIS MERAH.
                     wheels = wheel_points(float(x1), float(x2), float(y2))
                     vote_frames = sum(st.votes.values())
+                    # Recheck lokal tepat sebelum counting: jika posisi sebenarnya masih berputar di
+                    # sekitar lokasi yang sama, paksa PARKIR walaupun PARK_WINDOW belum selesai penuh.
+                    recent_now = [h for h in st.hist if now - h[0] <= DIRECTIONAL_MOTION_WINDOW_SEC]
+                    if len(recent_now) >= 4:
+                        rx = np.array([h[1] for h in recent_now], dtype=float)
+                        ry = np.array([h[2] for h in recent_now], dtype=float)
+                        spread = float(np.hypot(rx.max() - rx.min(), ry.max() - ry.min()))
+                        local_thr = max(PARK_MIN_RADIUS_PX, 0.20 * max(1.0, float(x2 - x1)))
+                        if spread <= local_thr:
+                            st.motion_confirmed = False
+                            st.parked = True
+                            st.park_anchor = (float(rx.mean()), float(ry.mean()))
+                            pm3 = remember_parked(park_memory, group, box, now)
+                            st.park_memory_id = pm3["id"]
+
+                    candidate_group = st.votes.most_common(1)[0][0] if st.votes else group
+                    directional_ok = (
+                        not st.parked
+                        and st.motion_confirmed
+                        and directional_motion_ok(st, entry_dirs[candidate_group], now, box)
+                    )
                     if (st.initialized and not st.counted and tid not in counted_ids
-                            and not st.parked and st.motion_confirmed
+                            and not st.parked and st.motion_confirmed and directional_ok
                             and vote_frames >= MIN_CLASS_CONFIRM_FRAMES):
                         cur_group = st.votes.most_common(1)[0][0]
                         target_roi = green_roi if cur_group == "motor" else red_roi
